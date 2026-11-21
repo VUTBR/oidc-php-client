@@ -1,5 +1,5 @@
 {
-  "name": "vutbr-cvis-web/oidc-client",
+  "name": "vutbr/oidc-client",
   "type": "library",
   "description": "OIDC client for VUT Auth Provider",
   "minimum-stability": "stable",
