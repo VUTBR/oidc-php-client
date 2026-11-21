@@ -302,6 +302,29 @@ class TokenExchangeTest extends ProviderTestCase
 		$provider->getAccessToken('authorization_code', ['code' => 'c', 'acrValues' => ['urn:mfa']]);
 	}
 
+	public function testRestoredAcrValuesAreEnforced(): void
+	{
+		// acr_values=urn:mfa was requested, the user stripped it from the URL and logged in with a password
+		$provider = $this->createProviderAfterRedirect();
+		$provider->setAuthorizationRequirements(['acrValues' => 'urn:mfa']);
+		$this->queueTokenResponse(['acr' => 'urn:password']);
+
+		$this->expectException(InvalidTokenException::class);
+		$this->expectExceptionMessage('acr');
+		$provider->getAccessToken('authorization_code', ['code' => 'c']);
+	}
+
+	public function testRestoredMaxAgeIsEnforced(): void
+	{
+		$provider = $this->createProviderAfterRedirect();
+		$provider->setAuthorizationRequirements(['maxAge' => 300]);
+		$this->queueTokenResponse(['auth_time' => TokenFactory::NOW - 600]);
+
+		$this->expectException(InvalidTokenException::class);
+		$this->expectExceptionMessage('max_age');
+		$provider->getAccessToken('authorization_code', ['code' => 'c']);
+	}
+
 	public function testRefreshTokenWithIdToken(): void
 	{
 		$provider = $this->createProviderAfterRedirect();
@@ -366,7 +389,11 @@ class TokenExchangeTest extends ProviderTestCase
 
 		$provider->setNonce(TokenFactory::NONCE);
 		$provider->setPkceCode(TokenFactory::PKCE);
-		$this->queueTokenResponse([], ['scope' => null, 'scopes' => 'openid profile trustedDevice', 'refresh_expires_in' => 3600]);
+		// the requested acr_values / max_age are enforced without passing them again
+		$this->queueTokenResponse(
+			['acr' => 'urn:mfa', 'auth_time' => TokenFactory::NOW - 60],
+			['scope' => null, 'scopes' => 'openid profile trustedDevice', 'refresh_expires_in' => 3600]
+		);
 
 		$token = $provider->getAccessToken('authorization_code', [
 			'redirect_uri' => 'https://app.example/openid/token',

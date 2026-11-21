@@ -51,9 +51,20 @@ class AuthorizationRequestTest extends ProviderTestCase
 
 		self::assertSame('urn:mfa urn:mfa:passwordless', $query['acr_values']);
 		self::assertSame('300', $query['max_age']);
+		self::assertSame(['acrValues' => 'urn:mfa urn:mfa:passwordless', 'maxAge' => 300], $provider->getAuthorizationRequirements());
 		self::assertSame('login', $query['prompt']);
 		// RFC 8707: repeated parameter, not resource[0]
 		self::assertStringContainsString('resource=https%3A%2F%2Fapi.example%2F&resource=https%3A%2F%2Fother.example%2F', $url);
+	}
+
+	public function testAuthorizationRequirementsAreResetForEachRequest(): void
+	{
+		$provider = $this->createProvider();
+		$provider->getAuthorizationUrl(['acr_values' => 'urn:mfa', 'max_age' => 0]);
+		self::assertSame(['acrValues' => 'urn:mfa', 'maxAge' => 0], $provider->getAuthorizationRequirements());
+
+		$provider->getAuthorizationUrl();
+		self::assertSame([], $provider->getAuthorizationRequirements());
 	}
 
 	public function testValidResponseReturnsCode(): void

@@ -39,7 +39,9 @@ $claims = $token->claims();
 $sub = $claims->get('sub');
 $sid = $claims->get('sid');
 
-// Optionally reject replays: remember $claims->get('jti') until the token expires.
+// Replays are not detected by the library. A production endpoint MUST reject a repeated iss + jti,
+// stored atomically (e.g. a DB unique key or Redis SET NX with TTL) until `exp`, or until
+// `iat` + maxLogoutTokenAge (default 120 s) when the token has no `exp`.
 
 foreach (sessionRegistry()->pullSessions(is_string($sub) ? $sub : null, is_string($sid) ? $sid : null) as $phpSessionId) {
 	// Destroy the user's PHP session; the request comes from id.vut.cz, so it has no session of its own

@@ -82,12 +82,13 @@ use Vut2\Component\OpenIDConnectClient\Exception\AuthorizationErrorException;
 use Vut2\Component\OpenIDConnectClient\Exception\InvalidAuthorizationResponseException;
 use Vut2\Component\OpenIDConnectClient\Exception\InvalidTokenException;
 
-// 1) Redirect the user to id.vut.cz and remember state, nonce and the PKCE verifier
+// 1) Redirect the user to id.vut.cz and remember state, nonce, the PKCE verifier and acr_values/max_age
 if (!isset($_GET['code']) && !isset($_GET['error'])) {
 	$url = $provider->getAuthorizationUrl();
 	$_SESSION['oauth2_state'] = $provider->getState();
 	$_SESSION['oauth2_nonce'] = $provider->getNonce();
 	$_SESSION['oauth2_pkce'] = $provider->getPkceCode();
+	$_SESSION['oauth2_requirements'] = $provider->getAuthorizationRequirements();
 
 	header('Location: ' . $url);
 	exit;
@@ -97,13 +98,15 @@ if (!isset($_GET['code']) && !isset($_GET['error'])) {
 $state = $_SESSION['oauth2_state'] ?? '';
 $nonce = $_SESSION['oauth2_nonce'] ?? null;
 $pkce = $_SESSION['oauth2_pkce'] ?? null;
-unset($_SESSION['oauth2_state'], $_SESSION['oauth2_nonce'], $_SESSION['oauth2_pkce']);
+$requirements = $_SESSION['oauth2_requirements'] ?? [];
+unset($_SESSION['oauth2_state'], $_SESSION['oauth2_nonce'], $_SESSION['oauth2_pkce'], $_SESSION['oauth2_requirements']);
 
 try {
 	$code = $provider->validateAuthorizationResponse($_GET, $state);
 
 	$provider->setNonce($nonce);
 	$provider->setPkceCode($pkce);
+	$provider->setAuthorizationRequirements($requirements);
 	$token = $provider->getAccessToken('authorization_code', [
 		'code' => $code,
 		// tolerated clock skew between id.vut.cz and your server, in seconds
@@ -219,13 +222,16 @@ $url = $provider->getAuthorizationUrl([
 	'prompt' => 'login',
 ]);
 
-// after the redirect back pass the same values for validation (they are not sent to the server)
-$token = $provider->getAccessToken('authorization_code', [
-	'code' => $code,
-	'acrValues' => ['urn:mfa', 'urn:mfa:passwordless'], // the acr claim must be one of them
-	'maxAge' => 3600,                                    // auth_time must be recent enough
-]);
+$_SESSION['oauth2_requirements'] = $provider->getAuthorizationRequirements();
+
+// after the redirect back: the acr claim must be one of acr_values, auth_time must be within max_age
+$provider->setAuthorizationRequirements($_SESSION['oauth2_requirements'] ?? []);
+$token = $provider->getAccessToken('authorization_code', ['code' => $code]);
 ```
+
+The user can remove `acr_values` / `max_age` from the authorization URL, so always restore the stored
+requirements (or pass the `acrValues` / `maxAge` options explicitly, which override them). Otherwise requesting
+MFA gives no protection.
 
 When id.vut.cz cannot satisfy the requested `acr_values`, `validateAuthorizationResponse()` throws an
 `AuthorizationErrorException` with `isUnmetAuthenticationRequirements() === true`.
@@ -311,7 +317,10 @@ foreach ($sessionStore->pullSessions($sub, $sid) as $phpSessionId) {
 http_response_code(200);
 ```
 
-To reject replayed logout tokens, remember `jti` until the token expires. A complete example is in
+A token without `exp` is rejected when its `iat` is older than `maxLogoutTokenAge` (option, default 120 s).
+The library does not detect replays: the endpoint MUST reject a repeated `iss` + `jti`, stored atomically
+(e.g. a DB unique key or Redis `SET NX` with TTL) until `exp`, or until `iat` + `maxLogoutTokenAge` when the
+token has no `exp`. A complete example is in
 [`examples/backchannel-logout.php`](examples/backchannel-logout.php).
 
 ### HTTP client

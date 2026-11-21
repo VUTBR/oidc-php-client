@@ -29,6 +29,17 @@ class LogoutTest extends ProviderTestCase
 		self::assertSame('session-1', $token->claims()->get('sid'));
 	}
 
+	public function testLogoutTokenWithoutExpirationMustBeRecent(): void
+	{
+		$provider = $this->createProvider();
+
+		$provider->getLogoutToken(TokenFactory::logoutToken(['exp' => null, 'iat' => TokenFactory::NOW - 60]));
+
+		$this->expectException(InvalidTokenException::class);
+		$this->expectExceptionMessage('too old');
+		$provider->getLogoutToken(TokenFactory::logoutToken(['exp' => null, 'iat' => TokenFactory::NOW - 300]));
+	}
+
 	/**
 	 * @return array<string, array{array<string, mixed>, string}>
 	 */

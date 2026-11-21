@@ -31,9 +31,9 @@ if ($action === 'logout') {
 	session_destroy();
 
 	header('Location: ' . $provider->getLogoutUrl([
-		'id_token_hint' => is_string($idToken) ? $idToken : null,
-		'post_logout_redirect_uri' => 'http://localhost:8002/client.php',
-	]));
+			'id_token_hint' => is_string($idToken) ? $idToken : null,
+			'post_logout_redirect_uri' => 'http://localhost:8002/client.php',
+		]));
 	return;
 }
 
@@ -42,13 +42,15 @@ if (isset($_GET['code']) || isset($_GET['error'])) {
 	$state = $_SESSION['oauth2_state'] ?? '';
 	$nonce = $_SESSION['oauth2_nonce'] ?? null;
 	$pkce = $_SESSION['oauth2_pkce'] ?? null;
-	unset($_SESSION['oauth2_state'], $_SESSION['oauth2_nonce'], $_SESSION['oauth2_pkce']);
+	$requirements = $_SESSION['oauth2_requirements'] ?? [];
+	unset($_SESSION['oauth2_state'], $_SESSION['oauth2_nonce'], $_SESSION['oauth2_pkce'], $_SESSION['oauth2_requirements']);
 
 	try {
 		$code = $provider->validateAuthorizationResponse($_GET, (string)$state);
 
 		$provider->setNonce($nonce);
 		$provider->setPkceCode($pkce);
+		$provider->setAuthorizationRequirements($requirements); // acr_values, max_age
 		$token = $provider->getAccessToken('authorization_code', [
 			'code' => $code,
 			'nbfToleranceSeconds' => 30, // tolerated clock skew between id.vut.cz and this server
@@ -126,7 +128,7 @@ if (isset($_SESSION['user'])) {
 	return;
 }
 
-// 4) Start the login: remember state, nonce and the PKCE verifier for the redirect back
+// 4) Start the login: remember state, nonce, the PKCE verifier and acr_values/max_age for the redirect back
 $authorizationUrl = $provider->getAuthorizationUrl([
 	// 'acr_values' => ['urn:mfa'],
 	// 'max_age' => 3600,
@@ -134,5 +136,6 @@ $authorizationUrl = $provider->getAuthorizationUrl([
 $_SESSION['oauth2_state'] = $provider->getState();
 $_SESSION['oauth2_nonce'] = $provider->getNonce();
 $_SESSION['oauth2_pkce'] = $provider->getPkceCode();
+$_SESSION['oauth2_requirements'] = $provider->getAuthorizationRequirements();
 
 header('Location: ' . $authorizationUrl);

@@ -44,9 +44,10 @@ use Vut2\Component\OpenIDConnectClient\Signer\RsaPss;
  * OpenID Connect client for id.vut.cz following OAuth 2.1 recommendations.
  *
  * Flow:
- *  1. getAuthorizationUrl(), store getState(), getPkceCode() and getNonce() in the session
+ *  1. getAuthorizationUrl(), store getState(), getPkceCode(), getNonce() and getAuthorizationRequirements() in the session
  *  2. validateAuthorizationResponse($_GET, $storedState) returns the authorization code
- *  3. setPkceCode() + setNonce() with stored values, then getAccessToken('authorization_code', ['code' => $code])
+ *  3. setPkceCode() + setNonce() + setAuthorizationRequirements() with stored values,
+ *     then getAccessToken('authorization_code', ['code' => $code])
  */
 class VutOpenIDConnectProvider extends VutProvider
 {
@@ -76,6 +77,9 @@ class VutOpenIDConnectProvider extends VutProvider
 	protected ?CacheItemPoolInterface $cache = null;
 
 	protected ?string $nonce = null;
+
+	/** @var array{acrValues?: string, maxAge?: int} acr_values / max_age sent in the last authorization request */
+	protected array $authorizationRequirements = [];
 
 	/** @var array<string> */
 	protected array $idTokenSigningAlgValues = [];
@@ -191,6 +195,26 @@ class VutOpenIDConnectProvider extends VutProvider
 	}
 
 	/**
+	 * Retrieves the acr_values / max_age sent in the last authorization request.
+	 *
+	 * @return array{acrValues?: string, maxAge?: int}
+	 */
+	public function getAuthorizationRequirements(): array
+	{
+		return $this->authorizationRequirements;
+	}
+
+	/**
+	 * Restores the requirements stored in the session; they are enforced by the authorization_code grant.
+	 *
+	 * @param array{acrValues?: string, maxAge?: int} $requirements
+	 */
+	public function setAuthorizationRequirements(array $requirements): void
+	{
+		$this->authorizationRequirements = $requirements;
+	}
+
+	/**
 	 * Issuer the ID tokens (and the authorization responses) are expected from.
 	 */
 	public function getIdTokenIssuer(): string
@@ -258,6 +282,9 @@ class VutOpenIDConnectProvider extends VutProvider
 	 *  - requireAuthTime: require the auth_time claim
 	 *  - acrValues: acr_values sent in the authorization request, the acr claim must be one of them
 	 *
+	 * For authorization_code, maxAge and acrValues default to getAuthorizationRequirements() (restore them
+	 * with setAuthorizationRequirements()); explicit options override them.
+	 *
 	 * @param mixed $grant
 	 * @param array<string, mixed> $options
 	 * @return AccessTokenInterface
@@ -271,6 +298,10 @@ class VutOpenIDConnectProvider extends VutProvider
 
 		$grant = $this->verifyGrant($grant);
 		$isAuthorizationCode = $this->isAuthorizationCodeGrant($grant);
+		if ($isAuthorizationCode) {
+			// the user can strip acr_values / max_age from the authorization URL, enforce what was sent
+			$validation += $this->authorizationRequirements;
+		}
 
 		if ($isAuthorizationCode && ($this->nonce === null || $this->nonce === '')) {
 			throw new \LogicException(
@@ -296,7 +327,11 @@ class VutOpenIDConnectProvider extends VutProvider
 	 * @see https://openid.net/specs/openid-connect-backchannel-1_0.html#Validation
 	 *
 	 * @param string $logoutToken Value of the `logout_token` POST parameter
-	 * @param array<string, mixed> $options nbfToleranceSeconds: allowed clock skew in seconds
+	 * Replays are NOT detected here: the application must reject a repeated iss + jti, stored atomically
+	 * until `exp`, or until `iat` + maxLogoutTokenAge when the token has no `exp`.
+	 *
+	 * @param array<string, mixed> $options nbfToleranceSeconds: allowed clock skew in seconds,
+	 *   maxLogoutTokenAge: max age in seconds of a token without `exp` (default 120)
 	 * @throws InvalidTokenException
 	 */
 	public function getLogoutToken(string $logoutToken, array $options = []): Token\Plain
@@ -318,9 +353,13 @@ class VutOpenIDConnectProvider extends VutProvider
 		$this->verifySignature($token, 'logout_token');
 
 		$leeway = $this->getLeeway($options);
+		$maxAge = $options['maxLogoutTokenAge'] ?? 120;
+		if (!is_int($maxAge) || $maxAge <= 0) {
+			throw new \InvalidArgumentException('Option "maxLogoutTokenAge" must be a positive integer.');
+		}
 		$constraints = [
 			new IssuedBy($this->nonEmpty($this->getIdTokenIssuer(), 'idTokenIssuer')),
-			new ValidAt($this->getClock(), $leeway, false),
+			new ValidAt($this->getClock(), $leeway, false, $maxAge),
 			new NotEmpty('jti'),
 			new HasSubOrSid(), // A Logout Token MUST contain either a sub or a sid Claim, and MAY contain both.
 			new DoesNotHaveClaim('nonce'), // PROHIBITED. A nonce Claim MUST NOT be present.
@@ -374,7 +413,17 @@ class VutOpenIDConnectProvider extends VutProvider
 			: $this->getRandomNonce();
 		$options['nonce'] = $this->nonce;
 
-		return parent::getAuthorizationParameters($options);
+		$params = parent::getAuthorizationParameters($options);
+
+		$this->authorizationRequirements = [];
+		if (isset($params['acr_values']) && is_string($params['acr_values']) && trim($params['acr_values']) !== '') {
+			$this->authorizationRequirements['acrValues'] = $params['acr_values'];
+		}
+		if (isset($params['max_age']) && is_numeric($params['max_age'])) {
+			$this->authorizationRequirements['maxAge'] = (int)$params['max_age'];
+		}
+
+		return $params;
 	}
 
 	/**
