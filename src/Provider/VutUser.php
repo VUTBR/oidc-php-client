@@ -1,4 +1,5 @@
 <?php
+declare(strict_types=1);
 
 namespace Vut2\Component\OpenIDConnectClient\Provider;
 
@@ -16,8 +17,6 @@ class VutUser extends GenericResourceOwner
 
 	/**
 	 * Get preferred display name.
-	 *
-	 * @return string
 	 */
 	public function getName(): ?string
 	{

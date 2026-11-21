@@ -1,137 +1,138 @@
 <?php
+declare(strict_types=1);
 
-require '../vendor/autoload.php';
+/**
+ * Login with id.vut.cz (authorization code flow with PKCE, OpenID Connect).
+ *
+ * Run: OIDC_CLIENT_ID=... OIDC_CLIENT_SECRET=... php -S localhost:8002 -t examples
+ * Open: http://localhost:8002/client.php
+ */
 
-ini_set('display_errors', 1);
-ini_set('error_reporting', E_ALL);
-ini_set('session.use_strict_mode', 1);
+use League\OAuth2\Client\Provider\Exception\IdentityProviderException;
+use Vut2\Component\OpenIDConnectClient\Exception\AuthorizationErrorException;
+use Vut2\Component\OpenIDConnectClient\Exception\InvalidAuthorizationResponseException;
+use Vut2\Component\OpenIDConnectClient\Exception\InvalidTokenException;
+use Vut2\Component\OpenIDConnectClient\Flow\AccessToken;
+use Vut2\Component\OpenIDConnectClient\Flow\IdToken;
 
-$success = session_start();
+require __DIR__ . '/bootstrap.php';
 
-$key = sprintf('file://%s/public.key', realpath(__DIR__));
+ini_set('session.use_strict_mode', '1');
+session_start();
 
-$signer = new \Lcobucci\JWT\Signer\Rsa\Sha256();
-$provider = new \Vut2\Component\OpenIDConnectClient\Provider\VutOpenIDConnectProvider(
-	[
-		'clientId' => '4c944b57-f951-47ea-88e6-b3d447feb29b',
-		'clientSecret' => 'abc123',
-		// Your server
-		'redirectUri' => 'http://localhost:8002/client.php',
-		//'redirectUri' => 'https://www.localhost/common/test/default',
-		'scopes' => [
-			'openid',
-			'profile',
-		],
+$provider = createProvider();
+$action = $_GET['action'] ?? null;
 
-		// Settings of the OP (OpenID Provider)
-		// The issuer of the identity token (id_token) this will be compared with what is returned in the token.
-		//'idTokenIssuer' => 'brentertainment.com',
+// 1) RP-initiated logout
+if ($action === 'logout') {
+	$idToken = $_SESSION['id_token'] ?? null;
+	sessionRegistry()->unregister(session_id());
+	$_SESSION = [];
+	session_destroy();
 
-		// Alternatively, you can use automatic discovery as long as your server
-		// has the <issuer>/.well-known/openid-configuration endpoint.
-		// This endpoint will then provide all provider settings above, so you only need to provide
-		// your own clientId, clientSecret, and redirectUri.
-		'issuer' => 'https://hotdoghouse24.cis.vut.cz/auth-server',
-	],
-	[
-		'signer' => $signer,
-		'httpClient' => new GuzzleHttp\Client(),
-	],
-);
-
-if (isset($_GET['code']) && isset($_SESSION['OAuth2.state']) && isset($_GET['state'])) {
-	if ($_GET['state'] == $_SESSION['OAuth2.state']) {
-		$provider->setNonce($_SESSION['OAuth2.nonce']);
-		$provider->setPkceCode($_SESSION['OAuth2.pkce']);
-
-		//unset($_SESSION['OAuth2.state']);
-		//unset($_SESSION['OAuth2.nonce']);
-		//unset($_SESSION['OAuth2.pkce']);
-
-		// receive authorization response
-		try {
-			$token = $provider->getAccessToken(
-				'authorization_code',
-				['code' => $_GET['code']],
-			);
-		} catch (\Vut2\Component\OpenIDConnectClient\Exception\InvalidTokenException|\Exception $e) {
-			var_dump($e);
-			return;
-		}
-
-		$response = [
-			'Token: ' . $token->getToken(),
-			'Refresh Token: ' . $token->getRefreshToken(),
-			'Expires: ' . $token->getExpires(),
-			'Has Expired: ' . $token->hasExpired(),
-			'All Claims: ' . print_r($token->getIdToken()->claims(), true),
-		];
-
-		echo implode('<br />', $response) . "<br>";
-
-		echo 'User: ' . var_dump($provider->getResourceOwner($token)) . '<br>';
-
-		$redirectUrl = $provider->getLogoutUrl();
-		echo 'Logout URL: ';
-		echo '<a href="' . $redirectUrl . '">' . $redirectUrl . '</a><br/>';
-
-		try {
-			$newAccessToken = $provider->getAccessToken('refresh_token', [
-				'refresh_token' => $token->getRefreshToken()
-			]);
-
-			echo "Refreshed access token: " . $newAccessToken->getToken() . "<br>";
-			echo "Refreshed refresh token: " . $newAccessToken->getRefreshToken() . "<br>";
-		} catch (\Exception $e) {
-			var_dump($e);
-		}
-
-		if ($newAccessToken) {
-
-			echo "<br>Revoke access token<br>";
-			try {
-				$response = $provider->revokeAccessToken($newAccessToken->getToken());
-				echo "<pre>" . var_dump($response) . "</pre>";
-			} catch (\Exception $exception) {
-				echo "<pre>" . var_dump($exception) . "</pre>";
-			}
-
-			echo "<br>Revoke refresh token<br>";
-			try {
-				$response = $provider->revokeAccessToken($newAccessToken->getRefreshToken());
-				echo "<pre>" . var_dump($response) . "</pre>";
-			} catch (\Exception $exception) {
-				echo "<pre>" . var_dump($exception) . "</pre>";
-			}
-		}
-
-		return;
-	} else {
-		//unset($_SESSION['OAuth2.state']);
-		//unset($_SESSION['OAuth2.nonce']);
-		//unset($_SESSION['OAuth2.pkce']);
-
-		echo 'Invalid state';
-
-		return null;
-	}
-}
-
-// send the authorization request
-if (empty($_GET['code'])) {
-	$redirectUrl = $provider->getAuthorizationUrl();
-
-	$_SESSION['OAuth2.state'] = $provider->getState();
-	$_SESSION['OAuth2.pkce'] = $provider->getPkceCode();
-	$_SESSION['OAuth2.nonce'] = $provider->getNonce();
-	// header(sprintf('Location: %s', $redirectUrl), true, 302);
-	echo '<a href="' . $redirectUrl . '">' . $redirectUrl . '</a><br/>';
-
-	var_dump($_SESSION);
-
+	header('Location: ' . $provider->getLogoutUrl([
+		'id_token_hint' => is_string($idToken) ? $idToken : null,
+		'post_logout_redirect_uri' => 'http://localhost:8002/client.php',
+	]));
 	return;
 }
 
-var_dump($_GET);
-var_dump($_SESSION);
-echo 'Tady se to nemělo dostat!';
+// 2) Redirect back from id.vut.cz
+if (isset($_GET['code']) || isset($_GET['error'])) {
+	$state = $_SESSION['oauth2_state'] ?? '';
+	$nonce = $_SESSION['oauth2_nonce'] ?? null;
+	$pkce = $_SESSION['oauth2_pkce'] ?? null;
+	unset($_SESSION['oauth2_state'], $_SESSION['oauth2_nonce'], $_SESSION['oauth2_pkce']);
+
+	try {
+		$code = $provider->validateAuthorizationResponse($_GET, (string)$state);
+
+		$provider->setNonce($nonce);
+		$provider->setPkceCode($pkce);
+		$token = $provider->getAccessToken('authorization_code', [
+			'code' => $code,
+			'nbfToleranceSeconds' => 30, // tolerated clock skew between id.vut.cz and this server
+		]);
+	} catch (AuthorizationErrorException $e) {
+		// e.g. access_denied, login_required, unmet_authentication_requirements (acr_values)
+		http_response_code(400);
+		echo 'Login failed: ' . e($e->getError());
+		return;
+	} catch (InvalidAuthorizationResponseException | InvalidTokenException $e) {
+		http_response_code(400);
+		echo 'Invalid response from the identity provider.';
+		error_log($e->getMessage());
+		return;
+	} catch (IdentityProviderException $e) {
+		http_response_code(502);
+		echo 'The identity provider rejected the request.';
+		error_log($e->getMessage());
+		return;
+	}
+
+	if (!$token instanceof IdToken || $token->getIdToken() === null) {
+		throw new \LogicException('An ID token is always returned for the authorization code grant.');
+	}
+
+	// The application needs these scopes; the server may grant fewer.
+	// An empty list means "as requested" (RFC 6749 §5.1).
+	$granted = $token->getScopes();
+	$missing = $granted === [] ? [] : array_diff(['openid', 'profile', 'email'], $granted);
+	if ($missing !== []) {
+		http_response_code(403);
+		echo 'Missing permissions: ' . e(implode(', ', $missing));
+		return;
+	}
+
+	$claims = $token->getIdToken()->claims();
+
+	// Prevent session fixation and remember the session for back-channel logout
+	session_regenerate_id(true);
+	$_SESSION['user'] = [
+		'sub' => $claims->get('sub'),
+		'name' => $claims->get('name'),
+		'email' => $claims->get('email'),
+	];
+	$_SESSION['id_token'] = $token->getIdToken()->toString();
+	// the whole token incl. expirations and scopes, restorable with new AccessToken(json_decode(...))
+	$_SESSION['token'] = json_encode($token);
+	$sid = $claims->get('sid');
+	sessionRegistry()->register(session_id(), (string)$claims->get('sub'), is_string($sid) ? $sid : null);
+
+	header('Location: client.php');
+	return;
+}
+
+// 3) Logged in
+if (isset($_SESSION['user'])) {
+	$token = new AccessToken((array)json_decode((string)$_SESSION['token'], true));
+
+	if ($action === 'refresh' && $token->getRefreshToken() !== null) {
+		$newToken = $provider->getAccessToken('refresh_token', ['refresh_token' => $token->getRefreshToken()]);
+		if ($newToken instanceof AccessToken) {
+			// Refresh tokens are rotated, always keep the newest one
+			$_SESSION['token'] = json_encode($newToken);
+			$token = $newToken;
+		}
+	}
+
+	$user = $_SESSION['user'];
+	echo '<p>Logged in as <strong>' . e((string)$user['name']) . '</strong> (' . e((string)$user['email']) . ')</p>';
+	echo '<p>Scopes: ' . e(implode(' ', $token->getScopes())) . '<br>';
+	echo 'Access token expires: ' . e(date('c', (int)$token->getExpires())) . '<br>';
+	$refreshExpires = $token->getRefreshTokenExpires();
+	echo 'Refresh token expires: ' . e($refreshExpires !== null ? date('c', $refreshExpires) : 'unknown') . '</p>';
+	echo '<p><a href="?action=refresh">Refresh token</a> | <a href="?action=logout">Log out</a></p>';
+	return;
+}
+
+// 4) Start the login: remember state, nonce and the PKCE verifier for the redirect back
+$authorizationUrl = $provider->getAuthorizationUrl([
+	// 'acr_values' => ['urn:mfa'],
+	// 'max_age' => 3600,
+]);
+$_SESSION['oauth2_state'] = $provider->getState();
+$_SESSION['oauth2_nonce'] = $provider->getNonce();
+$_SESSION['oauth2_pkce'] = $provider->getPkceCode();
+
+header('Location: ' . $authorizationUrl);

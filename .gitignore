@@ -10,6 +10,7 @@
 /temp
 /coverage.xml
 /.phpunit.result.cache
+/.phpunit.cache
 /phpunit-report.xml
 /.phpdoc
 /docs

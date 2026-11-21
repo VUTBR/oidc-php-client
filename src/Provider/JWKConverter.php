@@ -1,43 +1,45 @@
 <?php
+declare(strict_types=1);
 
 namespace Vut2\Component\OpenIDConnectClient\Provider;
 
 use InvalidArgumentException;
-use phpseclib3\Crypt\Common\AsymmetricKey;
-use phpseclib3\Crypt\PublicKeyLoader;
-use phpseclib3\Crypt\RSA\Formats\Keys\JWK;
-use phpseclib3\Math\BigInteger;
+use Vut2\Component\OpenIDConnectClient\Crypto\Phpseclib;
 
 class JWKConverter
 {
 	/**
 	 * Converts multiple JSON Web Keys (JWKs) to PEM format.
 	 *
-	 * @param array<array<string, int|string>> $jwkSet The array of JWKs to convert.
+	 * Keys that cannot be converted are skipped with an E_USER_WARNING.
 	 *
-	 * @return array<string> An array of PEM representations of the JWKs.
+	 * @param array<mixed> $jwkSet The array of JWKs to convert.
+	 *
+	 * @return array<string> PEM keys, indexed by `kid` when the JWK has one.
 	 *
 	 * @throws InvalidArgumentException If the input $jwkSet contains non-array elements.
-	 * @throws InvalidArgumentException If any of the JWKs in the $jwkSet is missing any of the required keys or if the key type is not RSA or if 'd' key is present.
 	 */
 	public function multipleToPEM(array $jwkSet): array
 	{
 		$keys = [];
 
-		foreach($jwkSet as $jwk) {
-			if(!is_array($jwk)) {
+		foreach ($jwkSet as $jwk) {
+			if (!is_array($jwk)) {
 				throw new InvalidArgumentException('`multipleToPEM` can only take in an array of JWKs.');
 			}
 
 			try {
-				$kid = $jwk['kid'] ?? null;
-				if ($kid) {
-					$keys[$kid] = $this->toPEM($jwk);
-				} else {
-					$keys[] = $this->toPEM($jwk);
-				}
+				$pem = $this->toPEM($jwk);
 			} catch (InvalidArgumentException $e) {
 				trigger_error($e->getMessage(), E_USER_WARNING);
+				continue;
+			}
+
+			$kid = $jwk['kid'] ?? null;
+			if (is_string($kid) && $kid !== '') {
+				$keys[$kid] = $pem;
+			} else {
+				$keys[] = $pem;
 			}
 		}
 
@@ -45,14 +47,12 @@ class JWKConverter
 	}
 
 	/**
-	 * Converts a JSON Web Key (JWK) to PEM format.
+	 * Converts a public JSON Web Key (JWK) to PEM format.
 	 *
-	 * @param array<string, string|int> $jwk The JWK to convert. It must contain the following keys: 'e', 'n', 'kty'.
+	 * @param array<mixed> $jwk The JWK to convert.
 	 *
 	 * @return string The PEM representation of the JWK.
-	 * @throws InvalidArgumentException If any of the required keys is missing or if the key type is not RSA or if 'd' key is present.
-	 * @throws \RuntimeException
-	 *
+	 * @throws InvalidArgumentException If the key type is missing, the key is private or cannot be parsed.
 	 */
 	public function toPEM(array $jwk): string
 	{
@@ -61,9 +61,14 @@ class JWKConverter
 		}
 
 		if (array_key_exists('d', $jwk)) {
-			throw new InvalidArgumentException('Public key is currently only supported.');
+			throw new InvalidArgumentException('Only public keys are supported.');
 		}
 
-		return PublicKeyLoader::load(json_encode($jwk, JSON_THROW_ON_ERROR));
+		$json = json_encode($jwk);
+		if ($json === false) {
+			throw new InvalidArgumentException('Unable to encode the JWK.');
+		}
+
+		return Phpseclib::toPem($json);
 	}
 }
