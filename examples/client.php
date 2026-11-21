@@ -111,6 +111,22 @@ if (isset($_SESSION['user'])) {
 
 	if ($action === 'refresh' && $token->getRefreshToken() !== null) {
 		$newToken = $provider->getAccessToken('refresh_token', ['refresh_token' => $token->getRefreshToken()]);
+
+		// The refreshed ID token is validated, but not compared with the one from the login.
+		// OIDC Core §12.2: sub (and auth_time) must not change, otherwise end the session.
+		$newIdToken = $newToken instanceof IdToken ? $newToken->getIdToken() : null;
+		if ($newIdToken !== null) {
+			if ($newIdToken->claims()->get('sub') !== $_SESSION['user']['sub']) {
+				sessionRegistry()->unregister(session_id());
+				$_SESSION = [];
+				session_destroy();
+				http_response_code(400);
+				echo 'Invalid response from the identity provider.';
+				return;
+			}
+			$_SESSION['id_token'] = $newIdToken->toString(); // newest id_token_hint for logout
+		}
+
 		if ($newToken instanceof AccessToken) {
 			// Refresh tokens are rotated, always keep the newest one
 			$_SESSION['token'] = json_encode($newToken);

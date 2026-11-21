@@ -258,7 +258,15 @@ $provider->revokeAccessToken($refreshToken, 'refresh_token');
 ```
 
 If the refresh response contains an ID token, it is validated (signature, `iss`, `aud`, time claims) and an
-`IdToken` is returned.
+`IdToken` is returned. It is not compared with the ID token from the login. Keep the user identity from the
+login, or, if you use the claims of the refreshed ID token, check OIDC Core §12.2 yourself:
+
+```php
+$new = $newToken instanceof IdToken ? $newToken->getIdToken() : null;
+if ($new !== null && $new->claims()->get('sub') !== $_SESSION['user']['sub']) {
+	// different user: end the session
+}
+```
 
 ### Logout (RP-initiated)
 
