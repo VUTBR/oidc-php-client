@@ -6,15 +6,11 @@ namespace Vut2\Component\OpenIDConnectClient\Signer;
 use Lcobucci\JWT\Signer;
 use Lcobucci\JWT\Signer\InvalidKeyProvided;
 use Lcobucci\JWT\Signer\Key;
-use phpseclib3\Crypt\PublicKeyLoader;
-use phpseclib3\Crypt\RSA;
-use phpseclib3\Crypt\RSA\PrivateKey;
-use phpseclib3\Crypt\RSA\PublicKey;
-use phpseclib3\Exception\NoKeyLoadedException;
+use Vut2\Component\OpenIDConnectClient\Crypto\Phpseclib;
 
-use function assert;
-use function is_string;
-
+/**
+ * RSASSA-PSS signer (PS256/PS384/PS512), which lcobucci/jwt does not provide.
+ */
 abstract class RsaPss implements Signer
 {
 	private const MINIMUM_KEY_LENGTH = 2048;
@@ -22,48 +18,43 @@ abstract class RsaPss implements Signer
 	final public function sign(string $payload, Key $key): string
 	{
 		try {
-			$private = PublicKeyLoader::loadPrivateKey($key->contents(), $key->passphrase());
-		} catch (NoKeyLoadedException $e) {
-			throw new InvalidKeyProvided('It was not possible to parse your key, reason: ' . $e->getMessage(), 0, $e);
+			$private = Phpseclib::loadPrivateKey($key->contents(), $key->passphrase());
+		} catch (\InvalidArgumentException $e) {
+			throw new InvalidKeyProvided($e->getMessage(), 0, $e);
 		}
 
-		if (! $private instanceof PrivateKey) {
+		if (!Phpseclib::isRsaPrivateKey($private)) {
 			throw InvalidKeyProvided::incompatibleKeyType('RSA', get_class($private));
 		}
 
-		if ($private->getLength() < self::MINIMUM_KEY_LENGTH) {
-			throw InvalidKeyProvided::tooShort(self::MINIMUM_KEY_LENGTH, $private->getLength());
+		$this->assertKeyLength($private);
+
+		try {
+			return Phpseclib::pssSign($private, $this->algorithm(), $payload);
+		} catch (\InvalidArgumentException $e) {
+			throw new InvalidKeyProvided($e->getMessage(), 0, $e);
 		}
-
-		$signature = $private
-			->withPadding(RSA::SIGNATURE_PSS)
-			->withHash($this->algorithm())
-			->withMGFHash($this->algorithm())
-			->sign($payload);
-
-		/** @infection-ignore-all */
-		assert(is_string($signature) && $signature !== '');
-
-		return $signature;
 	}
 
 	final public function verify(string $expected, string $payload, Key $key): bool
 	{
 		try {
-			$public = PublicKeyLoader::loadPublicKey($key->contents());
-		} catch (NoKeyLoadedException $e) {
-			throw new InvalidKeyProvided('It was not possible to parse your key, reason: ' . $e->getMessage(), 0, $e);
+			$public = Phpseclib::loadPublicKey($key->contents());
+		} catch (\InvalidArgumentException $e) {
+			throw new InvalidKeyProvided($e->getMessage(), 0, $e);
 		}
 
-		if (! $public instanceof PublicKey) {
+		if (!Phpseclib::isRsaPublicKey($public)) {
 			throw InvalidKeyProvided::incompatibleKeyType('RSA', get_class($public));
 		}
 
-		return $public
-			->withPadding(RSA::SIGNATURE_PSS)
-			->withHash($this->algorithm())
-			->withMGFHash($this->algorithm())
-			->verify($payload, $expected);
+		$this->assertKeyLength($public);
+
+		try {
+			return Phpseclib::pssVerify($public, $this->algorithm(), $payload, $expected);
+		} catch (\InvalidArgumentException $e) {
+			throw new InvalidKeyProvided($e->getMessage(), 0, $e);
+		}
 	}
 
 	/**
@@ -72,4 +63,12 @@ abstract class RsaPss implements Signer
 	 * @internal
 	 */
 	abstract public function algorithm(): string;
+
+	private function assertKeyLength(object $key): void
+	{
+		$length = Phpseclib::keyLength($key);
+		if ($length < self::MINIMUM_KEY_LENGTH) {
+			throw InvalidKeyProvided::tooShort(self::MINIMUM_KEY_LENGTH, $length);
+		}
+	}
 }

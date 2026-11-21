@@ -4,51 +4,63 @@ declare(strict_types=1);
 namespace Vut2\Component\OpenIDConnectClient\Flow;
 
 use Lcobucci\JWT\Encoding\JoseEncoder;
+use Lcobucci\JWT\Exception as JwtException;
 use Lcobucci\JWT\Token;
 use Lcobucci\JWT\Token\Parser;
-use League\OAuth2\Client\Token\AccessToken;
+use Vut2\Component\OpenIDConnectClient\Exception\InvalidTokenException;
 
+/**
+ * Access token response that also carries an ID token.
+ *
+ * The constructor only parses the ID token; signature and claims are validated by the provider.
+ */
 final class IdToken extends AccessToken
 {
-	private ?Token\Plain $idToken;
+	private ?Token\Plain $idToken = null;
 
 	/**
-	 * Constructor method for the class.
-	 *
-	 * @param array<string, mixed> $options An array of optional parameters (default: [])
-	 * @return void
+	 * @param array<string, mixed> $options Token endpoint response
+	 * @throws InvalidTokenException when the id_token cannot be parsed
 	 */
 	public function __construct(array $options = [])
 	{
 		parent::__construct($options);
 
-		$this->idToken = null;
-
 		if (isset($this->values['id_token'])) {
-			// Signature is validated outside, this just parses the token
-			/** @var Token\Plain $token */
-			$token = (new Parser(new JoseEncoder()))->parse($this->values['id_token']);
-			$this->idToken = $token;
-
+			$idToken = $this->values['id_token'];
 			unset($this->values['id_token']);
+
+			if (!is_string($idToken) || $idToken === '') {
+				throw new InvalidTokenException('The id_token must be a non-empty string.');
+			}
+
+			try {
+				$token = (new Parser(new JoseEncoder()))->parse($idToken);
+			} catch (JwtException $e) {
+				throw new InvalidTokenException('Unable to parse the id_token: ' . $e->getMessage(), 0, $e);
+			}
+
+			if (!$token instanceof Token\Plain) {
+				throw new InvalidTokenException('The id_token must be a signed (JWS) token.');
+			}
+
+			$this->idToken = $token;
 		}
 	}
 
 	public function getIdToken(): ?Token\Plain
 	{
-		return $this->idToken ?? null;
+		return $this->idToken;
 	}
 
 	/**
-	 * Serializes the object to JSON format.
-	 *
-	 * @return array<string, mixed> The serialized object as an associative array.
+	 * @return array<string, mixed>
 	 */
 	public function jsonSerialize(): array
 	{
 		$parameters = parent::jsonSerialize();
 
-		if (isset($this->idToken)) {
+		if ($this->idToken !== null) {
 			$parameters['id_token'] = $this->idToken->toString();
 		}
 

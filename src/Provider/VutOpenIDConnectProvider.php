@@ -6,62 +6,131 @@ namespace Vut2\Component\OpenIDConnectClient\Provider;
 use GuzzleHttp\Client as HttpClient;
 use Lcobucci\Clock\SystemClock;
 use Lcobucci\JWT\Encoding\JoseEncoder;
+use Lcobucci\JWT\Exception as JwtException;
 use Lcobucci\JWT\Signer;
-use Lcobucci\JWT\Signer\InvalidKeyProvided;
 use Lcobucci\JWT\Signer\Key;
 use Lcobucci\JWT\Signer\Key\InMemory;
 use Lcobucci\JWT\Token;
 use Lcobucci\JWT\Token\Parser;
+use Lcobucci\JWT\Validation\Constraint;
 use Lcobucci\JWT\Validation\Constraint\HasClaimWithValue;
 use Lcobucci\JWT\Validation\Constraint\IssuedBy;
-use Lcobucci\JWT\Validation\Constraint\LooseValidAt;
 use Lcobucci\JWT\Validation\Constraint\PermittedFor;
 use Lcobucci\JWT\Validation\Constraint\SignedWith;
-use Lcobucci\JWT\Validation\Constraint\StrictValidAt;
 use Lcobucci\JWT\Validation\ConstraintViolation;
 use Lcobucci\JWT\Validation\Validator;
 use League\OAuth2\Client\Grant\AbstractGrant;
-use League\OAuth2\Client\Grant\RefreshToken;
 use League\OAuth2\Client\Provider\Exception\IdentityProviderException;
-use League\OAuth2\Client\Token\AccessToken;
+use League\OAuth2\Client\Token\AccessToken as LeagueAccessToken;
 use League\OAuth2\Client\Token\AccessTokenInterface;
 use League\OAuth2\Client\Tool\RequestFactory;
 use Psr\Cache\CacheItemPoolInterface;
+use Psr\Log\LoggerInterface;
+use Vut2\Component\OpenIDConnectClient\Constraint\AcrIn;
+use Vut2\Component\OpenIDConnectClient\Constraint\AuthTimeValid;
 use Vut2\Component\OpenIDConnectClient\Constraint\DoesNotHaveClaim;
+use Vut2\Component\OpenIDConnectClient\Constraint\HasBackchannelLogoutEvent;
 use Vut2\Component\OpenIDConnectClient\Constraint\HasSubOrSid;
 use Vut2\Component\OpenIDConnectClient\Constraint\NotEmpty;
+use Vut2\Component\OpenIDConnectClient\Constraint\ValidAt;
+use Vut2\Component\OpenIDConnectClient\Exception\AuthorizationErrorException;
+use Vut2\Component\OpenIDConnectClient\Exception\InvalidAuthorizationResponseException;
 use Vut2\Component\OpenIDConnectClient\Exception\InvalidConfigurationException;
 use Vut2\Component\OpenIDConnectClient\Exception\InvalidTokenException;
+use Vut2\Component\OpenIDConnectClient\Flow\AccessToken;
 use Vut2\Component\OpenIDConnectClient\Flow\IdToken;
 use Vut2\Component\OpenIDConnectClient\Signer\RsaPss;
 
+/**
+ * OpenID Connect client for id.vut.cz following OAuth 2.1 recommendations.
+ *
+ * Flow:
+ *  1. getAuthorizationUrl(), store getState(), getPkceCode(), getNonce() and getAuthorizationRequirements() in the session
+ *  2. validateAuthorizationResponse($_GET, $storedState) returns the authorization code
+ *  3. setPkceCode() + setNonce() + setAuthorizationRequirements() with stored values,
+ *     then getAccessToken('authorization_code', ['code' => $code])
+ */
 class VutOpenIDConnectProvider extends VutProvider
 {
-	protected ?Signer $signer = null;
+	/** Options consumed by the client-side validation, never sent to the token endpoint. */
+	private const VALIDATION_OPTIONS = ['nbfToleranceSeconds', 'maxAge', 'requireAuthTime', 'acrValues'];
 
-	/** @var string|array<string> */
+	private const SIGNERS = [
+		'RS256' => Signer\Rsa\Sha256::class,
+		'RS384' => Signer\Rsa\Sha384::class,
+		'RS512' => Signer\Rsa\Sha512::class,
+		'PS256' => RsaPss\Sha256::class,
+		'PS384' => RsaPss\Sha384::class,
+		'PS512' => RsaPss\Sha512::class,
+		'ES256' => Signer\Ecdsa\Sha256::class,
+		'ES384' => Signer\Ecdsa\Sha384::class,
+		'ES512' => Signer\Ecdsa\Sha512::class,
+		'HS256' => Signer\Hmac\Sha256::class,
+		'HS384' => Signer\Hmac\Sha384::class,
+		'HS512' => Signer\Hmac\Sha512::class,
+	];
+
+	/** Accepted `typ` header values of a logout token (Back-Channel Logout 1.0 §2.4) */
+	private const LOGOUT_TOKEN_TYPES = ['logout+jwt', 'application/logout+jwt'];
+
+	/** @var string|array<mixed> PEM key(s) or file:// path(s), indexed by kid when known */
 	protected $publicKey;
 	protected string $idTokenIssuer;
 	protected ?CacheItemPoolInterface $cache = null;
+	protected ?LoggerInterface $logger = null;
 
 	protected ?string $nonce = null;
 
+	/** @var array{acrValues?: string, maxAge?: int} acr_values / max_age sent in the last authorization request */
+	protected array $authorizationRequirements = [];
+
+	/** @var array<string> */
+	protected array $idTokenSigningAlgValues = [];
+	protected bool $authorizationResponseIssParameterSupported = false;
+
+	/** @var object|null clock with a now(): DateTimeImmutable method (lcobucci/clock or PSR-20) */
+	private ?object $clock = null;
+
+	/** @var array<Key>|null */
+	private ?array $keys = null;
+
 	/**
+	 * Options (in addition to VutProvider options):
+	 *  - issuer: OpenID Provider issuer, used for discovery (default https://id.vut.cz/auth)
+	 *  - publicKey + idTokenIssuer: manual configuration without discovery
+	 *  - idTokenSigningAlgValues: allowed ID token algorithms (default from discovery, else RS256)
+	 *  - authorizationResponseIssParameterSupported: require `iss` in the authorization response (RFC 9207)
+	 *
+	 * Collaborators (in addition to VutProvider collaborators):
+	 *  - cache: PSR-6 cache for discovery and JWKS (1 hour)
+	 *  - clock: lcobucci/clock or PSR-20 clock (useful for tests)
+	 *  - logger: PSR-3 logger, e.g. for JWKS keys that cannot be used
+	 *
 	 * @param array<string, mixed> $options
 	 * @param array<string, mixed> $collaborators
 	 * @throws IdentityProviderException
 	 */
 	public function __construct(array $options = [], array $collaborators = [])
 	{
-		if (isset($collaborators['signer']) && !$collaborators['signer'] instanceof Signer) {
-			throw new \InvalidArgumentException(sprintf('Signer must be instance of %s', Signer::class));
-		}
-		$this->signer = $collaborators['signer'] ?? null;
 		if (isset($collaborators['cache'])) {
 			if (!$collaborators['cache'] instanceof CacheItemPoolInterface) {
 				throw new \InvalidArgumentException(sprintf('Cache must be instance of %s', CacheItemPoolInterface::class));
 			}
 			$this->cache = $collaborators['cache'];
+		}
+
+		if (isset($collaborators['logger'])) {
+			if (!$collaborators['logger'] instanceof LoggerInterface) {
+				throw new \InvalidArgumentException(sprintf('Logger must be instance of %s', LoggerInterface::class));
+			}
+			$this->logger = $collaborators['logger'];
+		}
+
+		if (isset($collaborators['clock'])) {
+			if (!is_object($collaborators['clock']) || !method_exists($collaborators['clock'], 'now')) {
+				throw new \InvalidArgumentException('Clock must provide a now() method (lcobucci/clock or PSR-20 clock).');
+			}
+			$this->clock = $collaborators['clock'];
 		}
 
 		if (empty($options['scopes'])) {
@@ -74,32 +143,44 @@ class VutOpenIDConnectProvider extends VutProvider
 			$options['scopes'][] = 'openid';
 		}
 
+		if (!isset($options['issuer']) && !isset($options['publicKey'])) {
+			$options['issuer'] = self::DEFAULT_ISSUER;
+		}
+
 		// Using discovery
-		if (isset($options['issuer']) && is_string($options['issuer'])) {
+		if (isset($options['issuer'])) {
+			if (!is_string($options['issuer']) || $options['issuer'] === '') {
+				throw new InvalidConfigurationException('Option "issuer" must be a non-empty string.');
+			}
+
 			if (empty($collaborators['requestFactory'])) {
 				$collaborators['requestFactory'] = new RequestFactory();
 			}
 			$this->setRequestFactory($collaborators['requestFactory']);
 
-			if (empty($collaborators['httpClient'])) {
-				$client_options = $this->getAllowedClientOptions($options);
-
-				$collaborators['httpClient'] = new HttpClient(
-					array_intersect_key($options, array_flip($client_options))
-				);
+			$collaborators = $this->initPsrHttpClient($collaborators);
+			if ($this->getPsrHttpClient() === null) {
+				if (empty($collaborators['httpClient'])) {
+					$clientOptions = $this->getAllowedClientOptions($options);
+					$collaborators['httpClient'] = new HttpClient(array_intersect_key($options, array_flip($clientOptions)));
+				}
+				$this->setHttpClient($collaborators['httpClient']);
 			}
-			$this->setHttpClient($collaborators['httpClient']);
 
+			$options['baseUrl'] = $options['baseUrl'] ?? $options['issuer'];
 			$options = $this->discoverConfiguration($options['issuer'], $options);
 		}
+
+		if (empty($options['idTokenSigningAlgValues'])) {
+			$options['idTokenSigningAlgValues'] = ['RS256'];
+		}
+		$options['idTokenSigningAlgValues'] = $this->normalizeAlgorithms($options['idTokenSigningAlgValues']);
 
 		parent::__construct($options, $collaborators);
 	}
 
 	/**
-	 * Retrieves the nonce.
-	 *
-	 * @return ?string The nonce value, or null if it is not set.
+	 * Retrieves the nonce sent in the last authorization request.
 	 */
 	public function getNonce(): ?string
 	{
@@ -107,11 +188,7 @@ class VutOpenIDConnectProvider extends VutProvider
 	}
 
 	/**
-	 * Sets the nonce value.
-	 *
-	 * @param ?string $nonce The nonce value.
-	 *
-	 * @return void
+	 * Restores the nonce stored in the session before exchanging the authorization code.
 	 */
 	public function setNonce(?string $nonce): void
 	{
@@ -119,153 +196,192 @@ class VutOpenIDConnectProvider extends VutProvider
 	}
 
 	/**
+	 * Retrieves the acr_values / max_age sent in the last authorization request.
+	 *
+	 * @return array{acrValues?: string, maxAge?: int}
+	 */
+	public function getAuthorizationRequirements(): array
+	{
+		return $this->authorizationRequirements;
+	}
+
+	/**
+	 * Restores the requirements stored in the session; they are enforced by the authorization_code grant.
+	 *
+	 * @param array{acrValues?: string, maxAge?: int} $requirements
+	 */
+	public function setAuthorizationRequirements(array $requirements): void
+	{
+		$this->authorizationRequirements = $requirements;
+	}
+
+	/**
+	 * Issuer the ID tokens (and the authorization responses) are expected from.
+	 */
+	public function getIdTokenIssuer(): string
+	{
+		return $this->idTokenIssuer;
+	}
+
+	/**
+	 * Whether the authorization server includes `iss` in every authorization response (RFC 9207).
+	 */
+	public function isAuthorizationResponseIssParameterSupported(): bool
+	{
+		return $this->authorizationResponseIssParameterSupported;
+	}
+
+	/**
+	 * Validates the authorization response the user agent was redirected back with and returns the code.
+	 *
+	 * Checks, in order: `iss` (RFC 9207, mix-up attack protection), `state` (CSRF protection),
+	 * error response and the presence of `code`.
+	 *
+	 * @param array<mixed> $query Query parameters of the redirect URI, typically $_GET
+	 * @param string $expectedState State stored in the session before the redirect (getState())
+	 *
+	 * @throws InvalidAuthorizationResponseException when the response must not be processed
+	 * @throws AuthorizationErrorException when the authorization server returned an error
+	 */
+	public function validateAuthorizationResponse(array $query, string $expectedState): string
+	{
+		if (array_key_exists('iss', $query)) {
+			if (!is_string($query['iss']) || $query['iss'] !== $this->getIdTokenIssuer()) {
+				throw new InvalidAuthorizationResponseException('The "iss" parameter of the authorization response does not match the expected issuer.');
+			}
+		} elseif ($this->authorizationResponseIssParameterSupported) {
+			throw new InvalidAuthorizationResponseException('The authorization response is missing the "iss" parameter.');
+		}
+
+		$state = $query['state'] ?? null;
+		if ($expectedState === '' || !is_string($state) || !hash_equals($expectedState, $state)) {
+			throw new InvalidAuthorizationResponseException('Invalid state of the authorization response.');
+		}
+
+		if (isset($query['error'])) {
+			throw AuthorizationErrorException::fromResponse($query);
+		}
+
+		$code = $query['code'] ?? null;
+		if (!is_string($code) || $code === '') {
+			throw new InvalidAuthorizationResponseException('The authorization response is missing the "code" parameter.');
+		}
+
+		return $code;
+	}
+
+	/**
 	 * Requests an access token using a specified grant and option set.
 	 *
-	 * @param string|AbstractGrant $grant
+	 * For the authorization_code grant the ID token is required and fully validated (signature,
+	 * iss, aud, exp/iat/nbf, nonce, azp and optionally acr and auth_time). An ID token returned
+	 * by the refresh_token grant is validated as well, without the nonce.
+	 *
+	 * Validation options (not sent to the server):
+	 *  - nbfToleranceSeconds: allowed clock skew in seconds (default 0)
+	 *  - maxAge: max_age sent in the authorization request, requires a recent auth_time
+	 *  - requireAuthTime: require the auth_time claim
+	 *  - acrValues: acr_values sent in the authorization request, the acr claim must be one of them
+	 *
+	 * For authorization_code, maxAge and acrValues default to getAuthorizationRequirements() (restore them
+	 * with setAuthorizationRequirements()); explicit options override them.
+	 *
+	 * @param mixed $grant
 	 * @param array<string, mixed> $options
 	 * @return AccessTokenInterface
 	 * @throws IdentityProviderException
+	 * @throws InvalidTokenException
 	 */
 	public function getAccessToken($grant, array $options = [])
 	{
+		$validation = array_intersect_key($options, array_flip(self::VALIDATION_OPTIONS));
+		$options = array_diff_key($options, $validation);
+
+		$grant = $this->verifyGrant($grant);
+		$isAuthorizationCode = $this->isAuthorizationCodeGrant($grant);
+		if ($isAuthorizationCode) {
+			// the user can strip acr_values / max_age from the authorization URL, enforce what was sent
+			$validation += $this->authorizationRequirements;
+		}
+
+		if ($isAuthorizationCode && ($this->nonce === null || $this->nonce === '')) {
+			throw new \LogicException(
+				'Nonce is missing. Store getNonce() before redirecting the user and restore it with setNonce() before exchanging the code.'
+			);
+		}
+
 		$accessToken = parent::getAccessToken($grant, $options);
-		if ((string)$grant == 'refresh_token') {
-			return $accessToken;
-		}
 
-		if (!$accessToken instanceof IdToken) {
-			throw new InvalidTokenException('Received wrong access token type');
-		}
-		$token = $accessToken->getIdToken();
-
-		// id_token is empty.
-		if ($token === null) {
-			$message = 'Expected an id_token but did not receive one from the authorization server.';
-			throw new InvalidTokenException($message);
-		}
-
-		// If the ID Token is received via direct communication between the Client and the Token Endpoint
-		// (which it is in this flow), the TLS server validation MAY be used to validate the issuer in place of checking
-		// the token signature. The Client MUST validate the signature of all other ID Tokens according to JWS [JWS]
-		// using the algorithm specified in the JWT alg Header Parameter. The Client MUST use the keys provided by
-		// the Issuer.
-		//
-		// The alg value SHOULD be the default of RS256 or the algorithm sent by the Client in the
-		// id_token_signed_response_alg parameter during Registration.
-		$verified = false;
-		$kid = $token->headers()->get('kid');
-		$keys = $this->getPublicKeys();
-		$kidKey = $kid ? ($keys[$kid] ?? null) : $kid;
-
-		if ($kidKey) {
-			if ($this->validateSignature($token, $kidKey) !== false) {
-				$verified = true;
-			}
-		} else {
-			foreach ($keys as $key) {
-				if ($this->validateSignature($token, $key) !== false) {
-					$verified = true;
-					break;
-				}
-			}
-		}
-
-		if (!$verified) {
-			$message = 'Received an invalid id_token from authorization server.';
-			throw new InvalidTokenException($message);
-		}
-
-		// validations
-		// @see http://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
-		$nbfToleranceSeconds = (isset($options['nbfToleranceSeconds']) && is_int($options['nbfToleranceSeconds'])) ? (int)$options['nbfToleranceSeconds'] : 0;
-
-		$constraints = [
-			new IssuedBy($this->getIdTokenIssuer()),
-			new PermittedFor($this->clientId),
-			// new HasClaimWithValue('auth_time', $currentTime),
-			new NotEmpty('sub'),
-		];
-
-		if ($token->claims()->has('nbf')) {
-			$constraints[] = new StrictValidAt(SystemClock::fromUTC(), new \DateInterval("PT{$nbfToleranceSeconds}S"));
-		} else {
-			$constraints[] = new LooseValidAt(SystemClock::fromUTC(), new \DateInterval("PT{$nbfToleranceSeconds}S"));
-		}
-
-		if ($this->nonce) {
-			$constraints[] = new HasClaimWithValue('nonce', $this->nonce);
-		}
-
-		// If the ID Token contains multiple audiences, the Client SHOULD verify that an azp Claim is present.
-		// If an azp (authorized party) Claim is present, the Client SHOULD verify that its client_id is the Claim Value.
-		if ($token->claims()->has('azp')) {
-			$constraints[] = new HasClaimWithValue('azp', $this->clientId);
-		}
-
-		try {
-			foreach ($constraints as $constraint) {
-				$constraint->assert($token);
-			}
-		} catch (ConstraintViolation $e) {
-			throw new InvalidTokenException('The id_token did not pass validation. ' . $e->getMessage());
+		$idToken = $accessToken instanceof IdToken ? $accessToken->getIdToken() : null;
+		if ($idToken !== null) {
+			$this->validateIdToken($idToken, $validation, $isAuthorizationCode);
+		} elseif ($isAuthorizationCode) {
+			throw new InvalidTokenException('Expected an id_token but did not receive one from the authorization server.');
 		}
 
 		return $accessToken;
 	}
 
 	/**
-	 * Parse and validate logout token.
+	 * Parses and validates a back-channel logout token.
 	 *
-	 * @param string $logoutToken
-	 * @param array<string, mixed> $options
-	 * @return Token
-	 * @throws IdentityProviderException
+	 * @see https://openid.net/specs/openid-connect-backchannel-1_0.html#Validation
+	 *
+	 * Replays are NOT detected here: the application must reject a repeated iss + jti, stored atomically until `exp`.
+	 *
+	 * @param string $logoutToken Value of the `logout_token` POST parameter
+	 * @param array<string, mixed> $options nbfToleranceSeconds: allowed clock skew in seconds
+	 * @throws InvalidTokenException
 	 */
-	public function getLogoutToken(string $logoutToken, array $options = []): Token
+	public function getLogoutToken(string $logoutToken, array $options = []): Token\Plain
 	{
-		$token = (new Parser(new JoseEncoder()))->parse($logoutToken);
-
-		$verified = false;
-		foreach ($this->getPublicKeys() as $key) {
-			if ($this->validateSignature($token, $key) !== false) {
-				$verified = true;
-				break;
-			}
+		if ($logoutToken === '') {
+			throw new InvalidTokenException('The logout_token is empty.');
 		}
-
-		if (!$verified) {
-			$message = 'Received an invalid logout_token from authorization server.';
-			throw new InvalidTokenException($message);
-		}
-
-		// validations
-		// @see http://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
-		$nbfToleranceSeconds = (isset($options['nbfToleranceSeconds']) && is_int($options['nbfToleranceSeconds'])) ? (int)$options['nbfToleranceSeconds'] : 0;
-
-		$expectedEvents = json_encode(["http://schemas.openid.net/event/backchannel-logout" => []]);
-		if ($expectedEvents === false) {
-			$message = 'Received an invalid logout_token from authorization server.';
-			throw new InvalidTokenException($message);
-		}
-
-		$constraints = [
-			new IssuedBy($this->getIdTokenIssuer()),
-			new PermittedFor($this->clientId),
-			new StrictValidAt(SystemClock::fromUTC(), new \DateInterval("PT{$nbfToleranceSeconds}S")),
-			new HasSubOrSid(), // A Logout Token MUST contain either a sub or a sid Claim, and MAY contain both.
-			new DoesNotHaveClaim('nonce'), // PROHIBITED. A nonce Claim MUST NOT be present.
-			new HasClaimWithValue('events', $expectedEvents)
-		];
 
 		try {
-			foreach ($constraints as $constraint) {
-				$constraint->assert($token);
-			}
-		} catch (ConstraintViolation $e) {
-			throw new InvalidTokenException('The logout_token did not pass validation. ' . $e->getMessage());
+			$token = (new Parser(new JoseEncoder()))->parse($logoutToken);
+		} catch (JwtException $e) {
+			throw new InvalidTokenException('Unable to parse the logout_token: ' . $e->getMessage(), 0, $e);
 		}
 
+		if (!$token instanceof Token\Plain) {
+			throw new InvalidTokenException('The logout_token must be a signed (JWS) token.');
+		}
+
+		// Explicit typing prevents cross-JWT confusion; the header is optional, but when present it must match
+		$typ = $token->headers()->get('typ');
+		if ($typ !== null && (!is_string($typ) || !in_array(strtolower($typ), self::LOGOUT_TOKEN_TYPES, true))) {
+			throw new InvalidTokenException('The logout_token has an invalid "typ" header.');
+		}
+
+		$this->verifySignature($token, 'logout_token');
+
+		$constraints = [
+			new IssuedBy($this->nonEmpty($this->getIdTokenIssuer(), 'idTokenIssuer')),
+			new PermittedFor($this->nonEmpty($this->clientId, 'clientId')),
+			new ValidAt($this->getClock(), $this->getLeeway($options)),
+			new NotEmpty('jti'),
+			new HasSubOrSid(), // A Logout Token MUST contain either a sub or a sid Claim, and MAY contain both.
+			new DoesNotHaveClaim('nonce'), // PROHIBITED. A nonce Claim MUST NOT be present.
+			new HasBackchannelLogoutEvent(),
+		];
+
+		$this->assertConstraints($token, $constraints, 'logout_token');
+
 		return $token;
+	}
+
+	/**
+	 * @inheritDoc
+	 */
+	public function getResourceOwner(LeagueAccessToken $token)
+	{
+		if ($token instanceof IdToken && $token->getIdToken() !== null) {
+			return $this->createResourceOwner($token->getIdToken()->claims()->all(), $token);
+		}
+
+		return parent::getResourceOwner($token);
 	}
 
 	/**
@@ -290,50 +406,121 @@ class VutOpenIDConnectProvider extends VutProvider
 	 */
 	protected function getAuthorizationParameters(array $options): array
 	{
-		$options = parent::getAuthorizationParameters($options);
-
-		$this->nonce = $this->getRandomNonce();
+		$this->nonce = isset($options['nonce']) && is_string($options['nonce']) && $options['nonce'] !== ''
+			? $options['nonce']
+			: $this->getRandomNonce();
 		$options['nonce'] = $this->nonce;
 
-		return $options;
+		$params = parent::getAuthorizationParameters($options);
+
+		$this->authorizationRequirements = [];
+		if (isset($params['acr_values']) && is_string($params['acr_values']) && trim($params['acr_values']) !== '') {
+			$this->authorizationRequirements['acrValues'] = $params['acr_values'];
+		}
+		if (isset($params['max_age']) && is_numeric($params['max_age'])) {
+			$this->authorizationRequirements['maxAge'] = (int)$params['max_age'];
+		}
+
+		return $params;
 	}
 
 	/**
-	 * Creates an access token from a response.
-	 *
-	 * The grant that was used to fetch the response can be used to provide
-	 * additional context.
-	 *
 	 * @param array<string, mixed> $response
-	 * @param AbstractGrant $grant
-	 * @return AccessTokenInterface
 	 */
 	protected function createAccessToken(array $response, AbstractGrant $grant): AccessTokenInterface
 	{
-		if ($grant instanceof RefreshToken) {
-			return parent::createAccessToken($response, $grant);
+		if (isset($response['id_token'])) {
+			return new IdToken($response);
 		}
 
-		return new IdToken($response);
+		return new AccessToken($response);
 	}
 
 	/**
-	 * @inheritDoc
+	 * Validates the claims and the signature of an ID token.
+	 *
+	 * @param array<string, mixed> $options
+	 * @throws InvalidTokenException
 	 */
-	public function getResourceOwner(AccessTokenInterface $token)
+	protected function validateIdToken(Token\Plain $token, array $options, bool $requireNonce): void
 	{
-		if ($token instanceof IdToken) {
-			return $this->createResourceOwner($token->getIdToken()->claims()->all(), $token);
+		// The Client MUST validate the signature of all ID Tokens according to JWS using the algorithm
+		// specified in the JWT alg Header Parameter and the keys provided by the Issuer.
+		$this->verifySignature($token, 'id_token');
+
+		// @see http://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
+		$leeway = $this->getLeeway($options);
+
+		$constraints = [
+			new IssuedBy($this->nonEmpty($this->getIdTokenIssuer(), 'idTokenIssuer')),
+			new PermittedFor($this->nonEmpty($this->clientId, 'clientId')),
+			new NotEmpty('sub'),
+			new ValidAt($this->getClock(), $leeway),
+		];
+
+		if ($requireNonce) {
+			$constraints[] = new HasClaimWithValue('nonce', (string)$this->nonce);
 		}
 
-		return parent::getResourceOwner($token);
+		// If an azp (authorized party) Claim is present, the Client SHOULD verify that its client_id is the Claim Value.
+		if ($token->claims()->has('azp')) {
+			$constraints[] = new HasClaimWithValue('azp', $this->clientId);
+		}
+
+		$acrValues = $options['acrValues'] ?? null;
+		if (is_string($acrValues)) {
+			$acrValues = preg_split('/\s+/', trim($acrValues)) ?: [];
+		}
+		if (is_array($acrValues) && $acrValues !== []) {
+			$constraints[] = new AcrIn(array_values(array_filter($acrValues, 'is_string')));
+		}
+
+		$maxAge = isset($options['maxAge']) && is_numeric($options['maxAge']) ? (int)$options['maxAge'] : null;
+		$requireAuthTime = !empty($options['requireAuthTime']);
+		if ($maxAge !== null || $requireAuthTime) {
+			$constraints[] = new AuthTimeValid($this->getClock(), $maxAge, $leeway, $requireAuthTime);
+		}
+
+		$this->assertConstraints($token, $constraints, 'id_token');
 	}
 
+	/**
+	 * Verifies the token signature with an allowed algorithm and the issuer keys.
+	 *
+	 * Asymmetric algorithms are verified with the issuer public keys only, HMAC algorithms with the
+	 * client secret only, so a public key can never be abused as an HMAC secret.
+	 *
+	 * @throws InvalidTokenException
+	 */
+	protected function verifySignature(Token\Plain $token, string $tokenName): void
+	{
+		$alg = $token->headers()->get('alg');
+		if (!is_string($alg) || $alg === '' || strtolower($alg) === 'none') {
+			throw new InvalidTokenException(sprintf('The %s must be signed.', $tokenName));
+		}
+
+		if (!in_array($alg, $this->idTokenSigningAlgValues, true)) {
+			throw new InvalidTokenException(sprintf('The %s is signed with a disallowed algorithm "%s".', $tokenName, $alg));
+		}
+
+		$signer = $this->getSignerForAlgorithm($alg);
+		if ($signer === null) {
+			throw new InvalidTokenException(sprintf('The %s is signed with an unsupported algorithm "%s".', $tokenName, $alg));
+		}
+
+		foreach ($this->getVerificationKeys($token, $alg) as $key) {
+			if ($this->isSignedWith($token, $signer, $key)) {
+				return;
+			}
+		}
+
+		throw new InvalidTokenException(sprintf('Received an invalid %s from authorization server.', $tokenName));
+	}
 
 	/**
 	 * Retrieves OpenID Connect configuration from a discovery endpoint
 	 * (<$issuer>/.well-known/openid-configuration) and merges it into
-	 * a given options array
+	 * a given options array. Explicitly given options take precedence.
 	 *
 	 * @param array<string, mixed> $options
 	 * @return array<string, mixed>
@@ -342,48 +529,29 @@ class VutOpenIDConnectProvider extends VutProvider
 	 */
 	protected function discoverConfiguration(string $issuer, array $options): array
 	{
-		$uri = $issuer . '/.well-known/openid-configuration';
+		$uri = rtrim($issuer, '/') . '/.well-known/openid-configuration';
+		$response = $this->fetchJson($uri);
 
-		$cacheId = hash('sha256', self::class . '_' . $uri);
-		$cachedResponse = $this->cache ? $this->cache->getItem($cacheId) : null;
-		$response = $cachedResponse ? $cachedResponse->get() : null;
-
-		if (!$cachedResponse || !$cachedResponse->isHit()) {
-			$request = $this->getRequest(self::METHOD_GET, $uri);
-			$response = $this->getParsedResponse($request);
-			if (is_array($response) === false) {
-				throw new InvalidConfigurationException(
-					'Invalid response received from discovery. Expected JSON.'
-				);
-			}
+		// OpenID Connect Discovery 1.0 §4.3: the issuer value MUST be identical to the configured issuer
+		if (!isset($response['issuer']) || $response['issuer'] !== $issuer) {
+			throw new InvalidConfigurationException(sprintf(
+				'Issuer "%s" in discovery configuration at %s does not match the configured issuer "%s".',
+				is_string($response['issuer'] ?? null) ? $response['issuer'] : '',
+				$uri,
+				$issuer
+			));
 		}
 
 		// Map configuration to options
 		$optionMapping = [
-			'idTokenIssuer' => [
-				'name' => 'issuer',
-				'required' => true
-			],
-			'urlAuthorize' => [
-				'name' => 'authorization_endpoint',
-				'required' => true
-			],
-			'urlAccessToken' => [
-				'name' => 'token_endpoint',
-				'required' => true
-			],
-			'urlResourceOwnerDetails' => [
-				'name' => 'userinfo_endpoint',
-				'required' => false
-			],
-			'urlEndSession' => [
-				'name' => 'end_session_endpoint',
-				'required' => false
-			],
-			'urlRevokeToken' => [
-				'name' => 'revocation_endpoint',
-				'required' => false,
-			]
+			'idTokenIssuer' => ['name' => 'issuer', 'required' => true],
+			'urlAuthorize' => ['name' => 'authorization_endpoint', 'required' => true],
+			'urlAccessToken' => ['name' => 'token_endpoint', 'required' => true],
+			'urlResourceOwnerDetails' => ['name' => 'userinfo_endpoint', 'required' => false],
+			'urlEndSession' => ['name' => 'end_session_endpoint', 'required' => false],
+			'urlRevokeToken' => ['name' => 'revocation_endpoint', 'required' => false],
+			'idTokenSigningAlgValues' => ['name' => 'id_token_signing_alg_values_supported', 'required' => false],
+			'authorizationResponseIssParameterSupported' => ['name' => 'authorization_response_iss_parameter_supported', 'required' => false],
 		];
 
 		foreach ($optionMapping as $optionKey => $responseKey) {
@@ -392,85 +560,36 @@ class VutOpenIDConnectProvider extends VutProvider
 					throw new InvalidConfigurationException(
 						"Required parameter {$responseKey['name']} missing in discovery configuration at $uri"
 					);
-				} else {
-					continue;
 				}
+				continue;
 			}
 
-			$options[$optionKey] ??= $response[$responseKey['name']];
+			$options[$optionKey] = $options[$optionKey] ?? $response[$responseKey['name']];
 		}
 
-		if ($this->cache && !$cachedResponse->isHit()) {
-			$cachedResponse->set($response);
-			$cachedResponse->expiresAfter(3600);
-			$this->cache->save($cachedResponse);
+		// OAuth 2.1 requires PKCE with S256
+		if (isset($response['code_challenge_methods_supported'])
+			&& (!is_array($response['code_challenge_methods_supported'])
+				|| !in_array(self::PKCE_METHOD_S256, $response['code_challenge_methods_supported'], true))
+		) {
+			throw new InvalidConfigurationException("The authorization server at $uri does not support PKCE with S256.");
 		}
 
-		// Validate scopes
-		/* todo: fix openid-configuration to show all possible scopes
-		if (isset($response['scopes_supported'])) {
-			$scopesSupported = $response['scopes_supported'];
-			foreach ($options['scopes'] as $scope) {
-				if (!in_array($scope, $scopesSupported, true)) {
-					throw new InvalidConfigurationException(
-						"Scope $scope is not supported in discovery configuration at $uri"
-					);
-				}
-			}
+		$options['tokenEndpointAuthMethod'] = $this->resolveTokenEndpointAuthMethod(
+			$options['tokenEndpointAuthMethod'] ?? null,
+			$response['token_endpoint_auth_methods_supported'] ?? null,
+			$uri
+		);
+
+		if (!isset($response['jwks_uri']) || !is_string($response['jwks_uri'])) {
+			throw new InvalidConfigurationException("Required parameter jwks_uri missing in discovery configuration at $uri");
 		}
-		*/
 
-		// Set public key
-		if (!isset($response["jwks_uri"])) {
-			throw new InvalidConfigurationException(
-				"Required parameter jwks_uri missing in discovery configuration at $uri"
-			);
-		}
-		$jwksUri = $response["jwks_uri"];
-
-
-		$cacheId = hash('sha256', self::class . '_' . $jwksUri);
-		$cachedResponse = $this->cache ? $this->cache->getItem($cacheId) : null;
-		$options['publicKey'] = $cachedResponse ? $cachedResponse->get() : null;
-
-		if (!$cachedResponse || !$cachedResponse->isHit()) {
-			$jwksRequest = $this->getRequest(self::METHOD_GET, $jwksUri);
-			$jwksResponse = $this->getParsedResponse($jwksRequest);
-			if (is_array($jwksResponse) === false || is_array($jwksResponse['keys'] ?? null) === false) {
-				throw new InvalidConfigurationException(
-					'Invalid response received from discovery. Expected JSON.'
-				);
-			}
-
-			// We will only need signature keys supported by our signer
-			$jwks = array_filter($jwksResponse['keys'], function ($jwk) {
-				if (!is_array($jwk)) {
-					return false;
-				}
-				if (isset($jwk['use']) && $jwk['use'] !== 'sig') {
-					return false;
-				}
-				if (isset($jwk['alg']) && $this->signer && $jwk['alg'] !== $this->signer->algorithmId()) {
-					return false;
-				}
-
-				return true;
-			});
-
-			if (count($jwks) === 0) {
-				throw new InvalidConfigurationException(
-					"No valid signing keys found in discovery at $uri"
-				);
-			}
-
-			$jwkConverter = new JWKConverter();
-			$options['publicKey'] = $jwkConverter->multipleToPEM($jwks);
-
-			if ($this->cache) {
-				$cachedResponse->set($options['publicKey']);
-				$cachedResponse->expiresAfter(3600);
-				$this->cache->save($cachedResponse);
-			}
+		if (!isset($options['publicKey'])) {
+			$allowedAlgorithms = isset($options['idTokenSigningAlgValues'])
+				? $this->normalizeAlgorithms($options['idTokenSigningAlgValues'])
+				: [];
+			$options['publicKey'] = $this->fetchPublicKeys($response['jwks_uri'], $allowedAlgorithms, $uri);
 		}
 
 		return $options;
@@ -480,9 +599,8 @@ class VutOpenIDConnectProvider extends VutProvider
 	 * Returns a new random string to use as nonce.
 	 *
 	 * @param int $length Length of the random string to be generated.
-	 * @return string
 	 */
-	protected function getRandomNonce(int $length = 64)
+	protected function getRandomNonce(int $length = 64): string
 	{
 		return substr(
 			strtr(
@@ -495,75 +613,256 @@ class VutOpenIDConnectProvider extends VutProvider
 		);
 	}
 
-	protected function validateSignature(Token $token, Key $key): bool
+	/**
+	 * @param array<Constraint> $constraints
+	 * @throws InvalidTokenException
+	 */
+	private function assertConstraints(Token\Plain $token, array $constraints, string $tokenName): void
 	{
-		$validator = new Validator();
-
-		$signer = $this->signer;
-		if (!$signer) {
-			$alg = $token->headers()->get('alg');
-
-			if (strpos($alg, 'RS') === 0) {
-				$signerType = Signer\Rsa::class;
-			} elseif (strpos($alg, 'ES') === 0) {
-				$signerType = Signer\Ecdsa::class;
-			} elseif (strpos($alg, 'HS') === 0) {
-				$signerType = Signer\Hmac::class;
-			} elseif (strpos($alg, 'PS') === 0) {
-				$signerType = RsaPss::class;
-			} else {
-				return false;
+		try {
+			foreach ($constraints as $constraint) {
+				$constraint->assert($token);
 			}
+		} catch (ConstraintViolation $e) {
+			throw new InvalidTokenException(sprintf('The %s did not pass validation. %s', $tokenName, $e->getMessage()), 0, $e);
+		}
+	}
 
-			$signerClass = $signerType . '\\Sha' . substr($alg, 2);
-
-			if (!class_exists($signerClass) || !is_subclass_of($signerClass, Signer::class)) {
-				return false;
-			}
-			$signer = new $signerClass();
+	private function getSignerForAlgorithm(string $alg): ?Signer
+	{
+		if (!isset(self::SIGNERS[$alg])) {
+			return null;
 		}
 
+		$class = self::SIGNERS[$alg];
+
+		return new $class();
+	}
+
+	/**
+	 * @return array<Key>
+	 */
+	private function getVerificationKeys(Token\Plain $token, string $alg): array
+	{
+		if (strpos($alg, 'HS') === 0) {
+			// OIDC Core §10.1: symmetric signatures use the octets of the client_secret as the key
+			return [InMemory::plainText($this->nonEmpty($this->clientSecret, 'clientSecret'))];
+		}
+
+		$keys = $this->getPublicKeys();
+		$kid = $token->headers()->get('kid');
+		if (is_string($kid) && $kid !== '' && isset($keys[$kid])) {
+			return [$keys[$kid]];
+		}
+
+		return array_values($keys);
+	}
+
+	private function isSignedWith(Token\Plain $token, Signer $signer, Key $key): bool
+	{
 		try {
-			return $validator->validate($token, new SignedWith($signer, $key));
-		} catch (InvalidKeyProvided $e) {
+			return (new Validator())->validate($token, new SignedWith($signer, $key));
+		} catch (\InvalidArgumentException $e) {
+			// incompatible or invalid key (e.g. EC key for an RSA signature, HMAC secret too short)
 			return false;
 		}
 	}
 
 	/**
-	 * Get the issuer of the OpenID Connect id_token
-	 */
-	protected function getIdTokenIssuer(): string
-	{
-		return $this->idTokenIssuer;
-	}
-
-
-	/**
-	 * @return Key[]
+	 * @return array<Key>
 	 */
 	private function getPublicKeys(): array
 	{
-		if (is_array($this->publicKey)) {
-			$self = $this;
-			return array_map(
-				static function (string $key) use ($self): Key {
-					return $self->constructKey($key);
-				},
-				$this->publicKey,
-			);
+		if ($this->keys === null) {
+			$publicKeys = is_array($this->publicKey) ? $this->publicKey : [$this->publicKey];
+			$keys = [];
+			foreach ($publicKeys as $id => $content) {
+				if (!is_string($content) || $content === '') {
+					continue;
+				}
+				$path = strpos($content, 'file://') === 0 ? substr($content, 7) : '';
+				$keys[$id] = $path !== ''
+					? InMemory::file($path)
+					: InMemory::plainText($content);
+			}
+			$this->keys = $keys;
 		}
 
-		return [$this->constructKey($this->publicKey)];
+		return $this->keys;
 	}
 
-	private function constructKey(string $content): Key
+	/**
+	 * @param array<string> $allowedAlgorithms
+	 * @return array<string> PEM keys indexed by kid when present
+	 * @throws InvalidConfigurationException
+	 * @throws IdentityProviderException
+	 */
+	private function fetchPublicKeys(string $jwksUri, array $allowedAlgorithms, string $discoveryUri): array
 	{
-		if (strpos($content, 'file://') === 0) {
-			return InMemory::file($content);
+		$cache = $this->cache;
+		$cacheItem = $cache !== null ? $cache->getItem(hash('sha256', self::class . '_pem_' . $jwksUri)) : null;
+		if ($cacheItem !== null && $cacheItem->isHit() && is_array($cacheItem->get()) && $cacheItem->get() !== []) {
+			/** @var array<string> $cached */
+			$cached = $cacheItem->get();
+
+			return $cached;
 		}
 
-		assert(!empty($content));
-		return InMemory::plainText($content);
+		$jwksResponse = $this->fetchJson($jwksUri, false);
+		if (!isset($jwksResponse['keys']) || !is_array($jwksResponse['keys'])) {
+			throw new InvalidConfigurationException("Invalid JWKS received from $jwksUri. Expected JSON with keys.");
+		}
+
+		// We only need signature keys usable with the allowed algorithms
+		$jwks = array_filter($jwksResponse['keys'], static function ($jwk) use ($allowedAlgorithms): bool {
+			if (!is_array($jwk)) {
+				return false;
+			}
+			if (isset($jwk['use']) && $jwk['use'] !== 'sig') {
+				return false;
+			}
+			if (isset($jwk['alg']) && $allowedAlgorithms !== [] && !in_array($jwk['alg'], $allowedAlgorithms, true)) {
+				return false;
+			}
+
+			return true;
+		});
+
+		$keys = $jwks === [] ? [] : (new JWKConverter($this->logger))->multipleToPEM($jwks);
+		if ($keys === []) {
+			throw new InvalidConfigurationException("No valid signing keys found in discovery at $discoveryUri");
+		}
+
+		if ($cache !== null && $cacheItem !== null) {
+			$cacheItem->set($keys);
+			$cacheItem->expiresAfter(3600);
+			$cache->save($cacheItem);
+		}
+
+		return $keys;
+	}
+
+	/**
+	 * @return array<mixed>
+	 * @throws InvalidConfigurationException
+	 * @throws IdentityProviderException
+	 */
+	private function fetchJson(string $uri, bool $useCache = true): array
+	{
+		$cache = $useCache ? $this->cache : null;
+		$cacheItem = $cache !== null ? $cache->getItem(hash('sha256', self::class . '_' . $uri)) : null;
+		if ($cacheItem !== null && $cacheItem->isHit() && is_array($cacheItem->get())) {
+			/** @var array<mixed> $cached */
+			$cached = $cacheItem->get();
+
+			return $cached;
+		}
+
+		$response = $this->getParsedResponse($this->getRequest(self::METHOD_GET, $uri));
+		if (!is_array($response)) {
+			throw new InvalidConfigurationException("Invalid response received from $uri. Expected JSON.");
+		}
+
+		if ($cache !== null && $cacheItem !== null) {
+			$cacheItem->set($response);
+			$cacheItem->expiresAfter(3600);
+			$cache->save($cacheItem);
+		}
+
+		return $response;
+	}
+
+	/**
+	 * @param mixed $configured
+	 * @param mixed $supported
+	 */
+	private function resolveTokenEndpointAuthMethod($configured, $supported, string $uri): string
+	{
+		if ($configured !== null) {
+			// An explicit choice is only checked against a list the server actually publishes
+			if (!is_string($configured) || (is_array($supported) && !in_array($configured, $supported, true))) {
+				throw new InvalidConfigurationException(sprintf(
+					'Token endpoint auth method "%s" is not supported by the authorization server at %s.',
+					is_string($configured) ? $configured : gettype($configured),
+					$uri
+				));
+			}
+
+			return $configured;
+		}
+
+		// client_secret_post is preferred (also when the server does not publish the list): league does not
+		// form-urlencode the credentials for HTTP Basic as RFC 6749 §2.3.1 requires
+		if (!is_array($supported)) {
+			return self::AUTH_METHOD_CLIENT_SECRET_POST;
+		}
+
+		foreach ([self::AUTH_METHOD_CLIENT_SECRET_POST, self::AUTH_METHOD_CLIENT_SECRET_BASIC] as $method) {
+			if (in_array($method, $supported, true)) {
+				return $method;
+			}
+		}
+
+		throw new InvalidConfigurationException(
+			"The authorization server at $uri supports neither client_secret_basic nor client_secret_post."
+		);
+	}
+
+	/**
+	 * @param mixed $algorithms
+	 * @return array<string>
+	 */
+	private function normalizeAlgorithms($algorithms): array
+	{
+		if (is_string($algorithms)) {
+			$algorithms = [$algorithms];
+		}
+		if (!is_array($algorithms)) {
+			throw new InvalidConfigurationException('idTokenSigningAlgValues must be a list of algorithms.');
+		}
+
+		$result = [];
+		foreach ($algorithms as $algorithm) {
+			if (is_string($algorithm) && $algorithm !== '' && strtolower($algorithm) !== 'none') {
+				$result[] = $algorithm;
+			}
+		}
+
+		if ($result === []) {
+			throw new InvalidConfigurationException('No usable ID token signing algorithm is configured.');
+		}
+
+		return array_values(array_unique($result));
+	}
+
+	/**
+	 * @param array<string, mixed> $options
+	 */
+	private function getLeeway(array $options): int
+	{
+		$leeway = $options['nbfToleranceSeconds'] ?? 0;
+
+		return is_int($leeway) && $leeway > 0 ? $leeway : 0;
+	}
+
+	/**
+	 * @return non-empty-string
+	 */
+	private function nonEmpty(string $value, string $name): string
+	{
+		if ($value === '') {
+			throw new InvalidConfigurationException(sprintf('Option "%s" must not be empty.', $name));
+		}
+
+		return $value;
+	}
+
+	private function getClock(): object
+	{
+		if ($this->clock === null) {
+			$this->clock = SystemClock::fromUTC();
+		}
+
+		return $this->clock;
 	}
 }

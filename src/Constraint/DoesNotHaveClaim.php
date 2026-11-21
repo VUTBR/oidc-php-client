@@ -13,6 +13,7 @@ use function in_array;
 
 final class DoesNotHaveClaim implements Constraint
 {
+	/** @var non-empty-string */
 	private string $claim;
 
 	/** @param non-empty-string $claim */

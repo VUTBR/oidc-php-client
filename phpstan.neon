@@ -1,7 +1,14 @@
 parameters:
 	paths:
 		- src
-	level: 7
+	level: 8
+	# PHP 7.4 compatibility is checked by running PHPStan on PHP 7.4 with --prefer-lowest dependencies in CI
+	ignoreErrors:
+		# phpseclib 3 and 4 live in different namespaces, only one of them is installed
+		-
+			identifier: class.notFound
+			path: src/Crypto/Phpseclib.php
+			reportUnmatched: false
 includes:
 	- vendor/spaze/phpstan-disallowed-calls/extension.neon
 	- vendor/phpstan/phpstan-deprecation-rules/rules.neon

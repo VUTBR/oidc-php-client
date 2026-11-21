@@ -1,148 +1,377 @@
-# OAuth 2.0 OpenID Connect Client
+# OAuth 2.1 / OpenID Connect Client for id.vut.cz
 
-This package uses the PHP League's [OAuth2 Client](https://github.com/thephpleague/oauth2-client) and this [JWT Token Library](https://github.com/lcobucci/jwt) to provide an OAuth2 OpenID Connect client.
+OpenID Connect client for the VUT identity provider ([id.vut.cz](https://id.vut.cz/auth/.well-known/openid-configuration)),
+built on [league/oauth2-client](https://github.com/thephpleague/oauth2-client) and [lcobucci/jwt](https://github.com/lcobucci/jwt).
+
+It is intended for PHP back-end applications, i.e. **confidential clients** with a `client_secret`.
+
+- Authorization code flow with mandatory **PKCE (S256)** and **nonce**
+- **Client credentials** grant for server-to-server access tokens
+- Full ID token validation: signature (algorithm allow-list, keys from JWKS selected by `kid`), `iss`, `aud`, `azp`, `exp`/`iat`/`nbf`, `nonce`, optionally `acr` and `auth_time`/`max_age`
+- Authorization response validation: `state` and `iss` ([RFC 9207](https://www.rfc-editor.org/rfc/rfc9207)), error responses
+- Client authentication with `client_secret_post` (default) or `client_secret_basic`
+- Refresh tokens (with rotation), token revocation ([RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)), resource indicators ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707))
+- RP-initiated logout and [back-channel logout](https://openid.net/specs/openid-connect-backchannel-1_0.html)
+- Discovery with optional PSR-6 cache
+- Guzzle or any **PSR-18** HTTP client (e.g. Symfony HttpClient)
 
 ## Requirements
 
-The following versions of PHP are supported.
+* PHP 7.4 – 8.6
+* `ext-json`, `ext-openssl`
 
-* PHP 7.4
-* PHP 8.0
-* PHP 8.1
-* PHP 8.2
-* PHP 8.3
-
-## Usage
-```php
-<?php
-$signer = new \Lcobucci\JWT\Signer\Rsa\Sha256();
-$provider = new \Vut2\Component\OpenIDConnectClient\Provider\VutOpenIDConnectProvider(
-	[
-		'clientId' => 'some client id',
-		'clientSecret' => 'client secret',
-		// Your server
-		'redirectUri' => 'http://localhost:8002/client.php',
-		'scopes' => [
-			'openid',
-			'profile',
-		],
-
-		// Settings of the OP (OpenID Provider)
-		// The issuer of the identity token (id_token) this will be compared with what is returned in the token.
-		//'idTokenIssuer' => 'brentertainment.com',
-
-		// Alternatively, you can use automatic discovery as long as your server
-		// has the <issuer>/.well-known/openid-configuration endpoint.
-		// This endpoint will then provide all provider settings above, so you only need to provide
-		// your own clientId, clientSecret, and redirectUri.
-		'issuer' => 'https://id.vut.cz/auth',
-	],
-	[
-		'signer' => $signer,
-	],
-);
-
-// send the authorization request
-if (empty($_GET['code'])) {
-    $redirectUrl = $provider->getAuthorizationUrl();
-    header(sprintf('Location: %s', $redirectUrl), true, 302);
-    return;
-}
-
-// receive authorization response
-try {
-    $token = $provider->getAccessToken('authorization_code', [
-        'code' => $_GET['code']
-    ]);
-} catch (\OpenIDConnectClient\Exception\InvalidTokenException $e) {
-    $errors = $provider->getValidatorChain()->getMessages();
-    return;
-}
-
-$accessToken    = $token->getToken();
-$refreshToken   = $token->getRefreshToken();
-$expires        = $token->getExpires();
-$hasExpired     = $token->hasExpired();
-$idToken        = $token->getIdToken();
-$email          = $idToken->claims()->get('email', false);
-$allClaims      = $idToken->claims();
-
-```
-
-### Run the Example
-An example client has been provided and can be found in the /examples directory of this repository.  To run the example you can utilize PHPs built-in web server.
-```bash
-$ php -S localhost:8002 client.php
-```
-Then open this link: [http://localhost:8002/](http://localhost:8002/)
-
-### Token Verification
-The id_token is verified using the lcobucci/jwt library.  You will need to pass the appropriate signer and publicKey to the OpenIdConnectProvider.
-
+Composer installs the newest dependency versions your PHP supports: `lcobucci/jwt` 4.3 or 5.x, `phpseclib` 3 or 4,
+Guzzle 7 or 8.
 
 ## Install
 
-Via Composer
-
-``` bash
-$ composer require vutbr-cvis-web/oidc-client
+```bash
+composer require vutbr/oidc-client
 ```
 
-## Clock difference tolerance in nbf
+Upgrading from 0.x? See [UPGRADE.md](UPGRADE.md).
 
-Some clock difference can be tolerated between the IdP and the SP by using the `nbfToleranceSeconds` option in the
-`getAccessToken` method call.
+## Usage
+
+### Configuration
 
 ```php
 <?php
+use Vut2\Component\OpenIDConnectClient\Provider\VutOpenIDConnectProvider;
 
-...
-// receive authorization response
-try {
-    $token = $provider->getAccessToken('authorization_code', [
-        'code' => $_GET['code'],
-        //adds 60 seconds to currentTime to tolerate 1 minute difference in clocks between IdP and SP
-        'nbfToleranceSeconds' => 60
-    ]);
-} catch (\OpenIDConnectClient\Exception\InvalidTokenException $e) {
-    $errors = $provider->getValidatorChain()->getMessages();
-    return;
-}
-
+$provider = new VutOpenIDConnectProvider(
+	[
+		'clientId' => 'your client id',
+		'clientSecret' => 'your client secret',
+		'redirectUri' => 'https://app.example/callback',
+		'scopes' => ['openid', 'profile', 'email'],
+		// optional, this is the default - all endpoints and keys are loaded from
+		// https://id.vut.cz/auth/.well-known/openid-configuration
+		'issuer' => 'https://id.vut.cz/auth',
+	],
+	[
+		// optional PSR-6 cache for the discovery document and the JWKS (1 hour)
+		'cache' => $cache,
+	],
+);
 ```
 
-## Refresh token and token revocation
+| Option | Default | Description |
+|---|---|---|
+| `clientId`, `clientSecret`, `redirectUri` | – | Client registration (required) |
+| `scopes` | `[]` | `openid` is always added |
+| `issuer` | `https://id.vut.cz/auth` | OpenID Provider, configured via discovery |
+| `tokenEndpointAuthMethod` | `client_secret_post` | Or `client_secret_basic`; when not set, `client_secret_post` unless the discovery document lists only `client_secret_basic` |
+| `idTokenSigningAlgValues` | from discovery, else `['RS256']` | Allowed ID token / logout token algorithms; set e.g. `['RS256']` to pin one |
+| `authorizationResponseIssParameterSupported` | from discovery | Require `iss` in the authorization response |
+| `publicKey` + `idTokenIssuer` | – | Manual configuration without discovery (PEM or `file://` path(s)) |
 
-Client also supports Refresh token grant and token revocation.
+| Collaborator | Description |
+|---|---|
+| `httpClient` | `GuzzleHttp\ClientInterface` or any `Psr\Http\Client\ClientInterface` |
+| `cache` | `Psr\Cache\CacheItemPoolInterface` for discovery and JWKS |
+| `clock` | Clock with `now(): DateTimeImmutable` (`lcobucci/clock` or PSR-20), useful in tests |
+
+### Login (authorization code flow)
 
 ```php
 <?php
+use Vut2\Component\OpenIDConnectClient\Exception\AuthorizationErrorException;
+use Vut2\Component\OpenIDConnectClient\Exception\InvalidAuthorizationResponseException;
+use Vut2\Component\OpenIDConnectClient\Exception\InvalidTokenException;
 
-...
+// 1) Redirect the user to id.vut.cz and remember state, nonce, the PKCE verifier and acr_values/max_age
+if (!isset($_GET['code']) && !isset($_GET['error'])) {
+	$url = $provider->getAuthorizationUrl();
+	$_SESSION['oauth2_state'] = $provider->getState();
+	$_SESSION['oauth2_nonce'] = $provider->getNonce();
+	$_SESSION['oauth2_pkce'] = $provider->getPkceCode();
+	$_SESSION['oauth2_requirements'] = $provider->getAuthorizationRequirements();
+
+	header('Location: ' . $url);
+	exit;
+}
+
+// 2) Validate the redirect back (iss, state, error) and exchange the code; the stored values are single-use
+$state = $_SESSION['oauth2_state'] ?? '';
+$nonce = $_SESSION['oauth2_nonce'] ?? null;
+$pkce = $_SESSION['oauth2_pkce'] ?? null;
+$requirements = $_SESSION['oauth2_requirements'] ?? [];
+unset($_SESSION['oauth2_state'], $_SESSION['oauth2_nonce'], $_SESSION['oauth2_pkce'], $_SESSION['oauth2_requirements']);
+
 try {
-    $newAccessToken = $provider->getAccessToken('refresh_token', [
-        'refresh_token' => $token->getRefreshToken()
-    ]);
+	$code = $provider->validateAuthorizationResponse($_GET, $state);
 
-    echo "Refreshed access token: " . $newAccessToken->getToken() . "<br>";
-    echo "Refreshed refresh token: " . $newAccessToken->getRefreshToken() . "<br>";
-} catch (\Exception $e) {
-    var_dump($e);
+	$provider->setNonce($nonce);
+	$provider->setPkceCode($pkce);
+	$provider->setAuthorizationRequirements($requirements);
+	$token = $provider->getAccessToken('authorization_code', [
+		'code' => $code,
+		// tolerated clock skew between id.vut.cz and your server, in seconds
+		'nbfToleranceSeconds' => 30,
+	]);
+} catch (AuthorizationErrorException $e) {
+	// the user denied access, or the server returned login_required, unmet_authentication_requirements, ...
+	showLoginError($e->getError());
+	exit;
+} catch (InvalidAuthorizationResponseException | InvalidTokenException $e) {
+	// state/iss mismatch or an invalid ID token - never trust such a response
+	http_response_code(400);
+	exit;
+}
+session_regenerate_id(true);
+
+// 3) Use the tokens
+$accessToken  = $token->getToken();
+$refreshToken = $token->getRefreshToken();
+$expires      = $token->getExpires();
+$scopes       = $token->getScopes();          // granted scopes
+$idToken      = $token->getIdToken();         // Lcobucci\JWT\Token\Plain, already validated
+$email        = $idToken->claims()->get('email');
+$user         = $provider->getResourceOwner($token); // VutUser built from the ID token claims
+```
+
+`getAccessToken()` throws a `LogicException` when the nonce or the PKCE verifier was not restored. This is a
+programming error, not a user error.
+
+### Token response
+
+`getAccessToken()` returns a `Flow\AccessToken` (or `Flow\IdToken`), a league `AccessToken` with two helpers
+for the fields sent by id.vut.cz. The raw response fields stay available in `getValues()`.
+
+```php
+$scopes = $token->getScopes();                      // 'scope' (or legacy 'scopes') as an array
+if (in_array('trustedDevice', $scopes, true)) {
+	// ...
+}
+
+$token->getExpires();                               // access token expiration (league)
+$token->getRefreshTokenExpires();                   // refresh token expiration from refresh_expires_in, or null
+```
+
+Per RFC 6749 §5.1 a missing or empty scope means the granted scope is identical to the requested one;
+`getScopes()` returns `[]` in that case.
+
+Tokens can be stored with `json_encode($token)` and restored with `new AccessToken(json_decode($json, true))`
+(`new IdToken(...)` for a token with an ID token), including both expirations.
+
+### Client credentials (server-to-server)
+
+For access tokens without a user (cron jobs, service-to-service calls) use the `client_credentials` grant.
+`VutProvider` is enough here: it uses the id.vut.cz endpoints directly, sends no discovery request and there is
+no nonce, PKCE or ID token involved.
+
+```php
+<?php
+use League\OAuth2\Client\Provider\Exception\IdentityProviderException;
+use Vut2\Component\OpenIDConnectClient\Provider\VutProvider;
+
+$provider = new VutProvider([
+	'clientId' => 'your client id',
+	'clientSecret' => 'your client secret',
+	// 'tokenEndpointAuthMethod' => 'client_secret_basic', // default: client_secret_post
+]);
+
+try {
+	$token = $provider->getAccessToken('client_credentials', [
+		'scope' => ['thiefReadonly', 'userGroups'], // sent space-separated
+		'resource' => 'https://api.example/',       // optional (RFC 8707), one URI
+	]);
+} catch (IdentityProviderException $e) {
+	// invalid_client (wrong credentials), invalid_scope (scope not allowed for the client), ...
+	throw $e;
+}
+
+$accessToken = $token->getToken();
+$expires     = $token->getExpires();   // Unix timestamp
+$scopes      = $token->getScopes();    // scopes actually granted
+
+// Call the API with "Authorization: Bearer <token>"
+$request  = $provider->getAuthenticatedRequest('GET', 'https://api.example/resource', $token);
+$response = $provider->getResponse($request);
+```
+
+There is no refresh token in this grant. Reuse the access token until it expires and then request a new one,
+e.g. with a PSR-6 cache:
+
+```php
+$item = $cache->getItem('vut-client-credentials-token');
+if (!$item->isHit()) {
+	$token = $provider->getAccessToken('client_credentials', ['scope' => ['thiefReadonly']]);
+	$item->set($token->jsonSerialize());
+	$expires = $token->getExpires() ?? time() + 300;
+	$item->expiresAt((new DateTimeImmutable())->setTimestamp($expires - 60)); // renew 1 min early
+	$cache->save($item);
+}
+$token = new \Vut2\Component\OpenIDConnectClient\Flow\AccessToken($item->get());
+```
+
+`VutOpenIDConnectProvider` supports the grant as well, which is useful when one application does both user
+login and server-to-server calls. It loads the discovery document in its constructor, so pass a `cache`
+collaborator to avoid fetching it on every request. A runnable example is in
+[`examples/client-credentials.php`](examples/client-credentials.php).
+
+### Authentication requirements (`acr_values`, `max_age`)
+
+```php
+$url = $provider->getAuthorizationUrl([
+	'acr_values' => ['urn:mfa', 'urn:mfa:passwordless'], // see acr_values_supported in the discovery
+	'max_age' => 3600,                                    // re-authenticate if the login is older
+	'prompt' => 'login',
+]);
+
+$_SESSION['oauth2_requirements'] = $provider->getAuthorizationRequirements();
+
+// after the redirect back: the acr claim must be one of acr_values, auth_time must be within max_age
+$provider->setAuthorizationRequirements($_SESSION['oauth2_requirements'] ?? []);
+$token = $provider->getAccessToken('authorization_code', ['code' => $code]);
+```
+
+The user can remove `acr_values` / `max_age` from the authorization URL, so always restore the stored
+requirements (or pass the `acrValues` / `maxAge` options explicitly, which override them). Otherwise requesting
+MFA gives no protection.
+
+When id.vut.cz cannot satisfy the requested `acr_values`, `validateAuthorizationResponse()` throws an
+`AuthorizationErrorException` with `isUnmetAuthenticationRequirements() === true`.
+
+### Resource indicators
+
+```php
+$url = $provider->getAuthorizationUrl(['resource' => 'https://api.example/']);
+$token = $provider->getAccessToken('authorization_code', ['code' => $code, 'resource' => 'https://api.example/']);
+```
+
+Only one resource per request is supported (the same limit as e.g. Entra ID); an array throws `InvalidArgumentException`.
+
+### Refresh token and token revocation
+
+```php
+$newToken = $provider->getAccessToken('refresh_token', ['refresh_token' => $token->getRefreshToken()]);
+
+// refresh tokens are rotated - always store the newest one
+$refreshToken = $newToken->getRefreshToken() ?? $token->getRefreshToken();
+
+$provider->revokeAccessToken($newToken->getToken(), 'access_token');
+$provider->revokeAccessToken($refreshToken, 'refresh_token');
+```
+
+If the refresh response contains an ID token, it is validated (signature, `iss`, `aud`, time claims) and an
+`IdToken` is returned. It is not compared with the ID token from the login. Keep the user identity from the
+login, or, if you use the claims of the refreshed ID token, check OIDC Core §12.2 yourself:
+
+```php
+$new = $newToken instanceof IdToken ? $newToken->getIdToken() : null;
+if ($new !== null && $new->claims()->get('sub') !== $_SESSION['user']['sub']) {
+	// different user: end the session
+}
+```
+
+### Logout (RP-initiated)
+
+```php
+$url = $provider->getLogoutUrl([
+	'id_token_hint' => $idToken,  // string or the token object
+	'post_logout_redirect_uri' => 'https://app.example/logged-out',
+	'state' => $logoutState,
+]);
+header('Location: ' . $url);
+```
+
+### Back-channel logout
+
+When the user logs out at id.vut.cz, the server sends a signed `logout_token` to the back-channel logout URI
+registered for your client. The request comes from the server, not from the user's browser, so the application
+must find and end the user's local sessions itself. Store the `sid` (and `sub`) from the ID token at login:
+
+```php
+// at login, after getAccessToken()
+$claims = $token->getIdToken()->claims();
+$sessionStore->register(session_id(), $claims->get('sub'), $claims->get('sid'));
+```
+
+The back-channel logout endpoint:
+
+```php
+<?php
+use Vut2\Component\OpenIDConnectClient\Exception\InvalidTokenException;
+
+header('Cache-Control: no-store');
+
+$logoutToken = $_POST['logout_token'] ?? null;
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !is_string($logoutToken) || $logoutToken === '') {
+	http_response_code(400);
+	exit;
 }
 
 try {
-  $response = $provider->revokeAccessToken($newAccessToken->getToken());
-  echo "<pre>" . var_dump($response) . "</pre>";
-} catch (\Exception $exception) {
-    var_dump($exception);
+	// signature, iss, aud, iat/exp, jti, sub or sid, the back-channel logout event, no nonce
+	$token = $provider->getLogoutToken($logoutToken, ['nbfToleranceSeconds' => 30]);
+} catch (InvalidTokenException $e) {
+	http_response_code(400);
+	exit;
 }
 
-try {
-  $response = $provider->revokeAccessToken($newAccessToken->getRefreshToken());
-  echo "<pre>" . var_dump($response) . "</pre>";
-} catch (\Exception $exception) {
-    echo "<pre>" . var_dump($exception) . "</pre>";
-}
+$sid = $token->claims()->get('sid'); // logs out one OP session
+$sub = $token->claims()->get('sub'); // without sid: all sessions of the user
+
+foreach ($sessionStore->pullSessions($sub, $sid) as $phpSessionId) {
+	session_id($phpSessionId);
+	session_start();
+	session_destroy();
 }
 
+http_response_code(200);
+```
+
+The logout token must contain `exp`; a `typ` header, when present, must be `logout+jwt`. The `events` claim is
+accepted as a JSON object or, as id.vut.cz sends it, as a JSON-encoded string of that object.
+The library does not detect replays: the endpoint MUST reject a repeated `iss` + `jti`, stored atomically
+(e.g. a DB unique key or Redis `SET NX` with TTL) until `exp`. A complete example is in
+[`examples/backchannel-logout.php`](examples/backchannel-logout.php).
+
+### HTTP client
+
+Guzzle is used by default. Any PSR-18 client can be passed as `httpClient`, for example Symfony HttpClient
+(the library itself does not depend on Symfony):
+
+```php
+use GuzzleHttp\Psr7\HttpFactory;
+use Symfony\Component\HttpClient\HttpClient;
+use Symfony\Component\HttpClient\Psr18Client;
+
+$provider = new VutOpenIDConnectProvider($options, [
+	'httpClient' => new Psr18Client(HttpClient::create(), new HttpFactory(), new HttpFactory()),
+]);
+```
+
+### Exceptions
+
+| Exception | When |
+|---|---|
+| `Exception\InvalidAuthorizationResponseException` | `state` or `iss` mismatch, missing `code` |
+| `Exception\AuthorizationErrorException` | The authorization server returned an error (`getError()`, `getErrorDescription()`) |
+| `Exception\InvalidTokenException` | ID token or logout token failed signature or claim validation |
+| `Exception\InvalidConfigurationException` | Invalid options or discovery document |
+| `League\OAuth2\Client\Provider\Exception\IdentityProviderException` | Error response from the token, revocation or userinfo endpoint |
+
+## Run the example
+
+```bash
+OIDC_CLIENT_ID=... OIDC_CLIENT_SECRET=... php -S localhost:8002 -t examples
+```
+
+Then open [http://localhost:8002/client.php](http://localhost:8002/client.php). The redirect URI
+`http://localhost:8002/client.php` must be registered for the client.
+
+Client credentials from the command line:
+
+```bash
+OIDC_CLIENT_ID=... OIDC_CLIENT_SECRET=... OIDC_SCOPES="thiefReadonly" php examples/client-credentials.php
+```
+
+## Development
+
+```bash
+composer install
+composer test      # composer audit + PHPStan + PHPUnit
 ```
