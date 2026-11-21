@@ -70,7 +70,8 @@ class VutOpenIDConnectProvider extends VutProvider
 		'HS512' => Signer\Hmac\Sha512::class,
 	];
 
-	protected ?Signer $signer = null;
+	/** Accepted `typ` header values of a logout token (Back-Channel Logout 1.0 §2.4) */
+	private const LOGOUT_TOKEN_TYPES = ['logout+jwt', 'application/logout+jwt'];
 
 	/** @var string|array<mixed> PEM key(s) or file:// path(s), indexed by kid when known */
 	protected $publicKey;
@@ -86,7 +87,6 @@ class VutOpenIDConnectProvider extends VutProvider
 	/** @var array<string> */
 	protected array $idTokenSigningAlgValues = [];
 	protected bool $authorizationResponseIssParameterSupported = false;
-	protected bool $validateAudience = true;
 
 	/** @var object|null clock with a now(): DateTimeImmutable method (lcobucci/clock or PSR-20) */
 	private ?object $clock = null;
@@ -100,10 +100,8 @@ class VutOpenIDConnectProvider extends VutProvider
 	 *  - publicKey + idTokenIssuer: manual configuration without discovery
 	 *  - idTokenSigningAlgValues: allowed ID token algorithms (default from discovery, else RS256)
 	 *  - authorizationResponseIssParameterSupported: require `iss` in the authorization response (RFC 9207)
-	 *  - validateAudience: check that `aud` contains the client_id (default true)
 	 *
 	 * Collaborators (in addition to VutProvider collaborators):
-	 *  - signer: lcobucci/jwt signer that must match the token `alg`
 	 *  - cache: PSR-6 cache for discovery and JWKS (1 hour)
 	 *  - clock: lcobucci/clock or PSR-20 clock (useful for tests)
 	 *  - logger: PSR-3 logger, e.g. for JWKS keys that cannot be used
@@ -114,13 +112,6 @@ class VutOpenIDConnectProvider extends VutProvider
 	 */
 	public function __construct(array $options = [], array $collaborators = [])
 	{
-		if (isset($collaborators['signer'])) {
-			if (!$collaborators['signer'] instanceof Signer) {
-				throw new \InvalidArgumentException(sprintf('Signer must be instance of %s', Signer::class));
-			}
-			$this->signer = $collaborators['signer'];
-		}
-
 		if (isset($collaborators['cache'])) {
 			if (!$collaborators['cache'] instanceof CacheItemPoolInterface) {
 				throw new \InvalidArgumentException(sprintf('Cache must be instance of %s', CacheItemPoolInterface::class));
@@ -181,7 +172,7 @@ class VutOpenIDConnectProvider extends VutProvider
 		}
 
 		if (empty($options['idTokenSigningAlgValues'])) {
-			$options['idTokenSigningAlgValues'] = $this->signer !== null ? [$this->signer->algorithmId()] : ['RS256'];
+			$options['idTokenSigningAlgValues'] = ['RS256'];
 		}
 		$options['idTokenSigningAlgValues'] = $this->normalizeAlgorithms($options['idTokenSigningAlgValues']);
 
@@ -336,12 +327,10 @@ class VutOpenIDConnectProvider extends VutProvider
 	 *
 	 * @see https://openid.net/specs/openid-connect-backchannel-1_0.html#Validation
 	 *
-	 * @param string $logoutToken Value of the `logout_token` POST parameter
-	 * Replays are NOT detected here: the application must reject a repeated iss + jti, stored atomically
-	 * until `exp`, or until `iat` + maxLogoutTokenAge when the token has no `exp`.
+	 * Replays are NOT detected here: the application must reject a repeated iss + jti, stored atomically until `exp`.
 	 *
-	 * @param array<string, mixed> $options nbfToleranceSeconds: allowed clock skew in seconds,
-	 *   maxLogoutTokenAge: max age in seconds of a token without `exp` (default 120)
+	 * @param string $logoutToken Value of the `logout_token` POST parameter
+	 * @param array<string, mixed> $options nbfToleranceSeconds: allowed clock skew in seconds
 	 * @throws InvalidTokenException
 	 */
 	public function getLogoutToken(string $logoutToken, array $options = []): Token\Plain
@@ -360,24 +349,23 @@ class VutOpenIDConnectProvider extends VutProvider
 			throw new InvalidTokenException('The logout_token must be a signed (JWS) token.');
 		}
 
+		// Explicit typing prevents cross-JWT confusion; the header is optional, but when present it must match
+		$typ = $token->headers()->get('typ');
+		if ($typ !== null && (!is_string($typ) || !in_array(strtolower($typ), self::LOGOUT_TOKEN_TYPES, true))) {
+			throw new InvalidTokenException('The logout_token has an invalid "typ" header.');
+		}
+
 		$this->verifySignature($token, 'logout_token');
 
-		$leeway = $this->getLeeway($options);
-		$maxAge = $options['maxLogoutTokenAge'] ?? 120;
-		if (!is_int($maxAge) || $maxAge <= 0) {
-			throw new \InvalidArgumentException('Option "maxLogoutTokenAge" must be a positive integer.');
-		}
 		$constraints = [
 			new IssuedBy($this->nonEmpty($this->getIdTokenIssuer(), 'idTokenIssuer')),
-			new ValidAt($this->getClock(), $leeway, false, $maxAge),
+			new PermittedFor($this->nonEmpty($this->clientId, 'clientId')),
+			new ValidAt($this->getClock(), $this->getLeeway($options)),
 			new NotEmpty('jti'),
 			new HasSubOrSid(), // A Logout Token MUST contain either a sub or a sid Claim, and MAY contain both.
 			new DoesNotHaveClaim('nonce'), // PROHIBITED. A nonce Claim MUST NOT be present.
 			new HasBackchannelLogoutEvent(),
 		];
-		if ($this->validateAudience) {
-			$constraints[] = new PermittedFor($this->nonEmpty($this->clientId, 'clientId'));
-		}
 
 		$this->assertConstraints($token, $constraints, 'logout_token');
 
@@ -465,13 +453,10 @@ class VutOpenIDConnectProvider extends VutProvider
 
 		$constraints = [
 			new IssuedBy($this->nonEmpty($this->getIdTokenIssuer(), 'idTokenIssuer')),
+			new PermittedFor($this->nonEmpty($this->clientId, 'clientId')),
 			new NotEmpty('sub'),
 			new ValidAt($this->getClock(), $leeway),
 		];
-
-		if ($this->validateAudience) {
-			$constraints[] = new PermittedFor($this->nonEmpty($this->clientId, 'clientId'));
-		}
 
 		if ($requireNonce) {
 			$constraints[] = new HasClaimWithValue('nonce', (string)$this->nonce);
@@ -645,14 +630,6 @@ class VutOpenIDConnectProvider extends VutProvider
 
 	private function getSignerForAlgorithm(string $alg): ?Signer
 	{
-		if ($this->signer !== null) {
-			if ($this->signer->algorithmId() !== $alg) {
-				return null;
-			}
-
-			return $this->signer;
-		}
-
 		if (!isset(self::SIGNERS[$alg])) {
 			return null;
 		}
@@ -736,22 +713,16 @@ class VutOpenIDConnectProvider extends VutProvider
 			throw new InvalidConfigurationException("Invalid JWKS received from $jwksUri. Expected JSON with keys.");
 		}
 
-		$signer = $this->signer;
 		// We only need signature keys usable with the allowed algorithms
-		$jwks = array_filter($jwksResponse['keys'], static function ($jwk) use ($allowedAlgorithms, $signer): bool {
+		$jwks = array_filter($jwksResponse['keys'], static function ($jwk) use ($allowedAlgorithms): bool {
 			if (!is_array($jwk)) {
 				return false;
 			}
 			if (isset($jwk['use']) && $jwk['use'] !== 'sig') {
 				return false;
 			}
-			if (isset($jwk['alg'])) {
-				if ($signer !== null && $jwk['alg'] !== $signer->algorithmId()) {
-					return false;
-				}
-				if ($allowedAlgorithms !== [] && !in_array($jwk['alg'], $allowedAlgorithms, true)) {
-					return false;
-				}
+			if (isset($jwk['alg']) && $allowedAlgorithms !== [] && !in_array($jwk['alg'], $allowedAlgorithms, true)) {
+				return false;
 			}
 
 			return true;
@@ -807,13 +778,9 @@ class VutOpenIDConnectProvider extends VutProvider
 	 */
 	private function resolveTokenEndpointAuthMethod($configured, $supported, string $uri): string
 	{
-		$advertised = is_array($supported);
-		// RFC 8414 §2: if omitted, the default is client_secret_basic
-		$supported = is_array($supported) ? $supported : [self::AUTH_METHOD_CLIENT_SECRET_BASIC];
-
 		if ($configured !== null) {
 			// An explicit choice is only checked against a list the server actually publishes
-			if (!is_string($configured) || ($advertised && !in_array($configured, $supported, true))) {
+			if (!is_string($configured) || (is_array($supported) && !in_array($configured, $supported, true))) {
 				throw new InvalidConfigurationException(sprintf(
 					'Token endpoint auth method "%s" is not supported by the authorization server at %s.',
 					is_string($configured) ? $configured : gettype($configured),
@@ -824,7 +791,13 @@ class VutOpenIDConnectProvider extends VutProvider
 			return $configured;
 		}
 
-		foreach ([self::AUTH_METHOD_CLIENT_SECRET_BASIC, self::AUTH_METHOD_CLIENT_SECRET_POST] as $method) {
+		// client_secret_post is preferred (also when the server does not publish the list): league does not
+		// form-urlencode the credentials for HTTP Basic as RFC 6749 §2.3.1 requires
+		if (!is_array($supported)) {
+			return self::AUTH_METHOD_CLIENT_SECRET_POST;
+		}
+
+		foreach ([self::AUTH_METHOD_CLIENT_SECRET_POST, self::AUTH_METHOD_CLIENT_SECRET_BASIC] as $method) {
 			if (in_array($method, $supported, true)) {
 				return $method;
 			}

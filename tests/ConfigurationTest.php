@@ -38,7 +38,8 @@ class ConfigurationTest extends ProviderTestCase
 		$provider = $this->createProvider([], self::discovery([], true));
 
 		self::assertTrue($provider->isAuthorizationResponseIssParameterSupported());
-		self::assertSame(VutProvider::AUTH_METHOD_CLIENT_SECRET_BASIC, $provider->getTokenEndpointAuthMethod());
+		// both advertised, client_secret_post is preferred
+		self::assertSame(VutProvider::AUTH_METHOD_CLIENT_SECRET_POST, $provider->getTokenEndpointAuthMethod());
 	}
 
 	public function testIssuerMismatchIsRejected(): void
@@ -70,11 +71,11 @@ class ConfigurationTest extends ProviderTestCase
 		$this->createProvider(['clientSecret' => '']);
 	}
 
-	public function testClientSecretPostWhenBasicIsNotAdvertised(): void
+	public function testClientSecretBasicWhenOnlyBasicIsAdvertised(): void
 	{
-		$provider = $this->createProvider([], self::discovery(['token_endpoint_auth_methods_supported' => ['client_secret_post']]));
+		$provider = $this->createProvider([], self::discovery(['token_endpoint_auth_methods_supported' => ['client_secret_basic']]));
 
-		self::assertSame(VutProvider::AUTH_METHOD_CLIENT_SECRET_POST, $provider->getTokenEndpointAuthMethod());
+		self::assertSame(VutProvider::AUTH_METHOD_CLIENT_SECRET_BASIC, $provider->getTokenEndpointAuthMethod());
 	}
 
 	public function testExplicitAuthMethodMustBeSupportedByServer(): void

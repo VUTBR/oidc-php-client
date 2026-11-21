@@ -9,7 +9,7 @@ It is intended for PHP back-end applications, i.e. **confidential clients** with
 - **Client credentials** grant for server-to-server access tokens
 - Full ID token validation: signature (algorithm allow-list, keys from JWKS selected by `kid`), `iss`, `aud`, `azp`, `exp`/`iat`/`nbf`, `nonce`, optionally `acr` and `auth_time`/`max_age`
 - Authorization response validation: `state` and `iss` ([RFC 9207](https://www.rfc-editor.org/rfc/rfc9207)), error responses
-- Client authentication with `client_secret_basic` (default) or `client_secret_post`
+- Client authentication with `client_secret_post` (default) or `client_secret_basic`
 - Refresh tokens (with rotation), token revocation ([RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)), resource indicators ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707))
 - RP-initiated logout and [back-channel logout](https://openid.net/specs/openid-connect-backchannel-1_0.html)
 - Discovery with optional PSR-6 cache
@@ -61,9 +61,8 @@ $provider = new VutOpenIDConnectProvider(
 | `clientId`, `clientSecret`, `redirectUri` | – | Client registration (required) |
 | `scopes` | `[]` | `openid` is always added |
 | `issuer` | `https://id.vut.cz/auth` | OpenID Provider, configured via discovery |
-| `tokenEndpointAuthMethod` | `client_secret_basic` | Or `client_secret_post`; when not set, chosen from the discovery document |
-| `idTokenSigningAlgValues` | from discovery, else `['RS256']` | Allowed ID token / logout token algorithms |
-| `validateAudience` | `true` | Check that `aud` contains the `client_id` |
+| `tokenEndpointAuthMethod` | `client_secret_post` | Or `client_secret_basic`; when not set, `client_secret_post` unless the discovery document lists only `client_secret_basic` |
+| `idTokenSigningAlgValues` | from discovery, else `['RS256']` | Allowed ID token / logout token algorithms; set e.g. `['RS256']` to pin one |
 | `authorizationResponseIssParameterSupported` | from discovery | Require `iss` in the authorization response |
 | `publicKey` + `idTokenIssuer` | – | Manual configuration without discovery (PEM or `file://` path(s)) |
 
@@ -71,7 +70,6 @@ $provider = new VutOpenIDConnectProvider(
 |---|---|
 | `httpClient` | `GuzzleHttp\ClientInterface` or any `Psr\Http\Client\ClientInterface` |
 | `cache` | `Psr\Cache\CacheItemPoolInterface` for discovery and JWKS |
-| `signer` | `Lcobucci\JWT\Signer`, pins the expected algorithm |
 | `clock` | Clock with `now(): DateTimeImmutable` (`lcobucci/clock` or PSR-20), useful in tests |
 
 ### Login (authorization code flow)
@@ -171,13 +169,13 @@ use Vut2\Component\OpenIDConnectClient\Provider\VutProvider;
 $provider = new VutProvider([
 	'clientId' => 'your client id',
 	'clientSecret' => 'your client secret',
-	// 'tokenEndpointAuthMethod' => 'client_secret_post', // default: client_secret_basic
+	// 'tokenEndpointAuthMethod' => 'client_secret_basic', // default: client_secret_post
 ]);
 
 try {
 	$token = $provider->getAccessToken('client_credentials', [
 		'scope' => ['thiefReadonly', 'userGroups'], // sent space-separated
-		'resource' => 'https://api.example/',       // optional (RFC 8707), string or array
+		'resource' => 'https://api.example/',       // optional (RFC 8707), one URI
 	]);
 } catch (IdentityProviderException $e) {
 	// invalid_client (wrong credentials), invalid_scope (scope not allowed for the client), ...
@@ -243,7 +241,7 @@ $url = $provider->getAuthorizationUrl(['resource' => 'https://api.example/']);
 $token = $provider->getAccessToken('authorization_code', ['code' => $code, 'resource' => 'https://api.example/']);
 ```
 
-Multiple resources can be passed as an array; they are sent as repeated `resource` parameters.
+Only one resource per request is supported (the same limit as e.g. Entra ID); an array throws `InvalidArgumentException`.
 
 ### Refresh token and token revocation
 
@@ -325,10 +323,10 @@ foreach ($sessionStore->pullSessions($sub, $sid) as $phpSessionId) {
 http_response_code(200);
 ```
 
-A token without `exp` is rejected when its `iat` is older than `maxLogoutTokenAge` (option, default 120 s).
+The logout token must contain `exp`; a `typ` header, when present, must be `logout+jwt`. The `events` claim is
+accepted as a JSON object or, as id.vut.cz sends it, as a JSON-encoded string of that object.
 The library does not detect replays: the endpoint MUST reject a repeated `iss` + `jti`, stored atomically
-(e.g. a DB unique key or Redis `SET NX` with TTL) until `exp`, or until `iat` + `maxLogoutTokenAge` when the
-token has no `exp`. A complete example is in
+(e.g. a DB unique key or Redis `SET NX` with TTL) until `exp`. A complete example is in
 [`examples/backchannel-logout.php`](examples/backchannel-logout.php).
 
 ### HTTP client

@@ -33,7 +33,7 @@
     "guzzlehttp/psr7": "^2.12.3 || ^3.0",
     "lcobucci/clock": "^2.0 || ^3.0",
     "lcobucci/jwt": "^4.3 || ^5.0",
-    "league/oauth2-client": "^2.7",
+    "league/oauth2-client": "^2.8.1",
     "phpseclib/phpseclib": "^3.0.58 || ^4.0.3",
     "psr/cache": "^1.0 || ^2.0 || ^3.0",
     "psr/http-client": "^1.0",

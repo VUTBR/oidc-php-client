@@ -45,7 +45,7 @@ class AuthorizationRequestTest extends ProviderTestCase
 			'acr_values' => ['urn:mfa', 'urn:mfa:passwordless'],
 			'max_age' => 300,
 			'prompt' => 'login',
-			'resource' => ['https://api.example/', 'https://other.example/'],
+			'resource' => 'https://api.example/',
 		]);
 		$query = self::query($url);
 
@@ -53,8 +53,7 @@ class AuthorizationRequestTest extends ProviderTestCase
 		self::assertSame('300', $query['max_age']);
 		self::assertSame(['acrValues' => 'urn:mfa urn:mfa:passwordless', 'maxAge' => 300], $provider->getAuthorizationRequirements());
 		self::assertSame('login', $query['prompt']);
-		// RFC 8707: repeated parameter, not resource[0]
-		self::assertStringContainsString('resource=https%3A%2F%2Fapi.example%2F&resource=https%3A%2F%2Fother.example%2F', $url);
+		self::assertSame('https://api.example/', $query['resource']);
 	}
 
 	public function testAuthorizationRequirementsAreResetForEachRequest(): void
@@ -75,12 +74,7 @@ class AuthorizationRequestTest extends ProviderTestCase
 			['code' => 'the-code', 'state' => 'state-1', 'iss' => TokenFactory::ISSUER],
 			'state-1'
 		));
-	}
-
-	public function testIssIsOptionalWhenNotAdvertised(): void
-	{
-		$provider = $this->createProvider();
-
+		// iss is optional when the server does not advertise it
 		self::assertSame('the-code', $provider->validateAuthorizationResponse(['code' => 'the-code', 'state' => 'state-1'], 'state-1'));
 	}
 

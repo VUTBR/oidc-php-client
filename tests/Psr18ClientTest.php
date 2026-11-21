@@ -51,7 +51,7 @@ class Psr18ClientTest extends ProviderTestCase
 		self::assertCount(3, $client->requests);
 		self::assertSame('https://id.vut.cz/auth/.well-known/openid-configuration', (string)$client->requests[0]->getUri());
 		self::assertSame('https://id.vut.cz/auth/common/oauth2/token', (string)$client->requests[2]->getUri());
-		self::assertStringStartsWith('Basic ', $client->requests[2]->getHeaderLine('Authorization'));
+		self::assertStringContainsString('client_secret=', (string)$client->requests[2]->getBody());
 	}
 
 	public function testErrorResponseThrows(): void

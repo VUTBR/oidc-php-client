@@ -26,7 +26,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST' || !is_string($logoutToken) ||
 }
 
 try {
-	// Verifies the signature, iss, aud, iat/exp, jti, sub|sid, the logout event and the absence of nonce
+	// Verifies typ, the signature, iss, aud, iat/exp, jti, sub|sid, the logout event and the absence of nonce
 	$token = createProvider()->getLogoutToken($logoutToken, ['nbfToleranceSeconds' => 30]);
 } catch (InvalidTokenException $e) {
 	error_log('Back-channel logout rejected: ' . $e->getMessage());
@@ -40,8 +40,7 @@ $sub = $claims->get('sub');
 $sid = $claims->get('sid');
 
 // Replays are not detected by the library. A production endpoint MUST reject a repeated iss + jti,
-// stored atomically (e.g. a DB unique key or Redis SET NX with TTL) until `exp`, or until
-// `iat` + maxLogoutTokenAge (default 120 s) when the token has no `exp`.
+// stored atomically (e.g. a DB unique key or Redis SET NX with TTL) until `exp`.
 
 foreach (sessionRegistry()->pullSessions(is_string($sub) ? $sub : null, is_string($sid) ? $sid : null) as $phpSessionId) {
 	// Destroy the user's PHP session; the request comes from id.vut.cz, so it has no session of its own

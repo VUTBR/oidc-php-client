@@ -44,7 +44,8 @@ Class hierarchy: `League GenericProvider` → `Provider\VutProvider` → `Provid
 
 - **`VutProvider`**: OAuth 2.1 layer.
   - Requires `clientSecret`, forces PKCE `S256` and fills default endpoint URLs from `baseUrl` (default `https://id.vut.cz/auth` + `/common/oauth2/...`).
-  - Picks the option provider by `tokenEndpointAuthMethod`: `OptionProvider\ClientSecretBasicOptionProvider` (default) or `ClientSecretPostOptionProvider`. Both build bodies via `Tool\QueryString`, which sends list values as repeated params (RFC 8707 `resource`).
+  - Picks the league option provider by `tokenEndpointAuthMethod`: `PostAuthOptionProvider` (`client_secret_post`, default) or `HttpBasicAuthOptionProvider` (`client_secret_basic`). Post is preferred because league does not form-urlencode Basic credentials. Discovery keeps post unless the server lists only basic.
+  - RFC 8707 `resource` is a single string; arrays are rejected.
   - **HTTP**: league only accepts Guzzle. A PSR-18 `httpClient` collaborator is split off in `initPsrHttpClient()` and used by the overridden `getResponse()`.
   - `getAccessToken()` requires the PKCE verifier for `authorization_code` and strips it for other grants.
   - Also handles revocation (`revokeAccessToken`) and RP-initiated logout (`getLogoutUrl`).
@@ -65,7 +66,7 @@ Class hierarchy: `League GenericProvider` → `Provider\VutProvider` → `Provid
     - `createAccessToken` returns `Flow\IdToken` when `id_token` is present, otherwise `Flow\AccessToken`. Both have `getScopes()`, which reads `scope` with a fallback to the legacy `scopes`.
     - ID tokens are validated in `validateIdToken()` (also for refresh responses, without the nonce) using constraints from `Constraint/`.
   - **`validateAuthorizationResponse()`**: checks `iss` (RFC 9207), then `state`, then the error response, and returns the code.
-  - **`getLogoutToken()`**: validates back-channel logout tokens (`HasBackchannelLogoutEvent`, `HasSubOrSid`, `DoesNotHaveClaim('nonce')`, `jti`, iat/exp).
+  - **`getLogoutToken()`**: validates back-channel logout tokens (`HasBackchannelLogoutEvent`, `HasSubOrSid`, `DoesNotHaveClaim('nonce')`, `jti`, iat/exp required, `typ` = `logout+jwt` when present). id.vut.cz sends `events` as a JSON-encoded string, so `HasBackchannelLogoutEvent` accepts that form too; keep it compatible.
   - The nonce, state and PKCE verifier live on the provider instance. Callers persist them across the redirect with `getNonce`/`setNonce` and `getPkceCode`/`setPkceCode`.
 - `Flow\AccessToken` is a minimal league `AccessToken`: `getScopes()` splits `scope` (fallback legacy `scopes`), and `refresh_expires_in` is kept as an absolute `refresh_expires` (like league `expires_in` → `expires`) so it survives `jsonSerialize()`. Keep it league-like and avoid extra provider state.
 - The two typical uses are OIDC login (`VutOpenIDConnectProvider`) and `client_credentials`. For `client_credentials`, plain `VutProvider` is enough: no discovery, no ID token, and it returns `Flow\AccessToken` (covered by `tests/ClientCredentialsTest.php`).

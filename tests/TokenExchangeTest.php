@@ -49,15 +49,14 @@ class TokenExchangeTest extends ProviderTestCase
 		$request = $this->lastRequest();
 		$body = self::formBody($request);
 		self::assertSame('https://id.vut.cz/auth/common/oauth2/token', (string)$request->getUri());
-		self::assertSame(
-			'Basic ' . base64_encode(TokenFactory::CLIENT_ID . ':' . TokenFactory::CLIENT_SECRET),
-			$request->getHeaderLine('Authorization')
-		);
+		// client_secret_post is the default
+		self::assertSame('', $request->getHeaderLine('Authorization'));
+		self::assertSame(TokenFactory::CLIENT_ID, $body['client_id']);
+		self::assertSame(TokenFactory::CLIENT_SECRET, $body['client_secret']);
 		self::assertSame('authorization_code', $body['grant_type']);
 		self::assertSame('the-code', $body['code']);
 		self::assertSame(TokenFactory::PKCE, $body['code_verifier']);
 		self::assertSame(TokenFactory::REDIRECT_URI, $body['redirect_uri']);
-		self::assertArrayNotHasKey('client_secret', $body);
 		// client-side validation options are never sent to the server
 		self::assertArrayNotHasKey('nbfToleranceSeconds', $body);
 
@@ -67,31 +66,20 @@ class TokenExchangeTest extends ProviderTestCase
 		self::assertSame('jana@example.com', $user->getEmail());
 	}
 
-	public function testClientSecretPost(): void
+	public function testClientSecretBasic(): void
 	{
-		$provider = $this->createProviderAfterRedirect(['tokenEndpointAuthMethod' => 'client_secret_post']);
+		$provider = $this->createProviderAfterRedirect(['tokenEndpointAuthMethod' => 'client_secret_basic']);
 		$this->queueTokenResponse();
 
 		$provider->getAccessToken('authorization_code', ['code' => 'the-code']);
 
 		$request = $this->lastRequest();
 		$body = self::formBody($request);
-		self::assertSame('', $request->getHeaderLine('Authorization'));
-		self::assertSame(TokenFactory::CLIENT_ID, $body['client_id']);
-		self::assertSame(TokenFactory::CLIENT_SECRET, $body['client_secret']);
-	}
-
-	public function testResourceIsSentAsRepeatedParameter(): void
-	{
-		$provider = $this->createProviderAfterRedirect();
-		$this->queueTokenResponse();
-
-		$provider->getAccessToken('authorization_code', ['code' => 'the-code', 'resource' => ['https://a.example/', 'https://b.example/']]);
-
-		self::assertStringContainsString(
-			'resource=https%3A%2F%2Fa.example%2F&resource=https%3A%2F%2Fb.example%2F',
-			(string)$this->lastRequest()->getBody()
+		self::assertSame(
+			'Basic ' . base64_encode(TokenFactory::CLIENT_ID . ':' . TokenFactory::CLIENT_SECRET),
+			$request->getHeaderLine('Authorization')
 		);
+		self::assertArrayNotHasKey('client_secret', $body);
 	}
 
 	public function testMissingNonceIsALogicError(): void
@@ -173,14 +161,6 @@ class TokenExchangeTest extends ProviderTestCase
 		$token = $provider->getAccessToken('authorization_code', ['code' => 'the-code', 'nbfToleranceSeconds' => 30]);
 
 		self::assertInstanceOf(IdToken::class, $token);
-	}
-
-	public function testAudienceValidationCanBeDisabled(): void
-	{
-		$provider = $this->createProviderAfterRedirect(['validateAudience' => false]);
-		$this->queueTokenResponse(['aud' => 'other-client']);
-
-		self::assertInstanceOf(IdToken::class, $provider->getAccessToken('authorization_code', ['code' => 'the-code']));
 	}
 
 	public function testMultipleAudiencesIncludingClient(): void
@@ -439,8 +419,13 @@ class TokenExchangeTest extends ProviderTestCase
 		self::assertSame(200, $response->getStatusCode());
 		$request = $this->lastRequest();
 		self::assertSame('https://id.vut.cz/auth/common/oauth2/revoke', (string)$request->getUri());
-		self::assertStringStartsWith('Basic ', $request->getHeaderLine('Authorization'));
-		self::assertSame(['token' => 'refresh-1', 'token_type_hint' => 'refresh_token'], self::formBody($request));
+		self::assertSame('', $request->getHeaderLine('Authorization'));
+		self::assertSame([
+			'client_id' => TokenFactory::CLIENT_ID,
+			'client_secret' => TokenFactory::CLIENT_SECRET,
+			'token' => 'refresh-1',
+			'token_type_hint' => 'refresh_token',
+		], self::formBody($request));
 	}
 
 	public function testRevokeTokenFailure(): void

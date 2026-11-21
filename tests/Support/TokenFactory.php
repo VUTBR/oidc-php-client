@@ -48,11 +48,12 @@ final class TokenFactory
 	}
 
 	/**
-	 * Default back-channel logout token claims; a null value removes the claim.
+	 * Default back-channel logout token claims and headers; a null value removes the claim or header.
 	 *
 	 * @param array<string, mixed> $claims
+	 * @param array<string, mixed> $headers
 	 */
-	public static function logoutToken(array $claims = []): string
+	public static function logoutToken(array $claims = [], array $headers = []): string
 	{
 		$claims += [
 			'iss' => self::ISSUER,
@@ -65,7 +66,7 @@ final class TokenFactory
 			'events' => ['http://schemas.openid.net/event/backchannel-logout' => new \stdClass()],
 		];
 
-		return self::build($claims, ['kid' => 'default', 'typ' => 'logout+jwt'], null, null);
+		return self::build($claims, $headers + ['kid' => 'default', 'typ' => 'logout+jwt'], null, null);
 	}
 
 	/**

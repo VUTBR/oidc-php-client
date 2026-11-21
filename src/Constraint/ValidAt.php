@@ -13,18 +13,15 @@ use Lcobucci\JWT\Validation\ConstraintViolation;
  * Time validation of a token that works the same with lcobucci/jwt 4 and 5.
  *
  * - `iat` is required and must not be in the future
- * - `exp` is required (unless disabled) and must not have passed
- * - without `exp`, `iat` must not be older than the optional max age
+ * - `exp` is required and must not have passed
  * - `nbf` is checked when present
  */
 final class ValidAt implements Constraint
 {
 	private \Closure $now;
 	private \DateInterval $leeway;
-	private bool $requireExpiration;
-	private ?int $maxAgeWithoutExpiration;
 
-	public function __construct(object $clock, int $leewaySeconds = 0, bool $requireExpiration = true, ?int $maxAgeWithoutExpiration = null)
+	public function __construct(object $clock, int $leewaySeconds = 0)
 	{
 		if (!method_exists($clock, 'now')) {
 			throw new \InvalidArgumentException('Clock must provide a now() method.');
@@ -32,8 +29,6 @@ final class ValidAt implements Constraint
 
 		$this->now = \Closure::fromCallable([$clock, 'now']);
 		$this->leeway = new \DateInterval('PT' . max(0, $leewaySeconds) . 'S');
-		$this->requireExpiration = $requireExpiration;
-		$this->maxAgeWithoutExpiration = $maxAgeWithoutExpiration;
 	}
 
 	public function assert(Token $token): void
@@ -60,20 +55,8 @@ final class ValidAt implements Constraint
 		}
 
 		if (!$claims->has(RegisteredClaims::EXPIRATION_TIME)) {
-			if ($this->requireExpiration) {
-				throw ConstraintViolation::error('"Expiration Time" claim missing', $this);
-			}
-
-			$issuedAt = $claims->get(RegisteredClaims::ISSUED_AT);
-			if ($this->maxAgeWithoutExpiration !== null && $issuedAt instanceof \DateTimeImmutable
-				&& $issuedAt->getTimestamp() + $this->maxAgeWithoutExpiration < $now->sub($this->leeway)->getTimestamp()
-			) {
-				throw ConstraintViolation::error('The token is too old', $this);
-			}
-
-			return;
+			throw ConstraintViolation::error('"Expiration Time" claim missing', $this);
 		}
-
 		if ($token->isExpired($now->sub($this->leeway))) {
 			throw ConstraintViolation::error('The token is expired', $this);
 		}

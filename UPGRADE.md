@@ -35,18 +35,20 @@ $token = $provider->getAccessToken('authorization_code', ['code' => $code]);
 - Default endpoint URLs of `VutProvider` now point to the real endpoints (`https://id.vut.cz/auth/common/oauth2/...`).
 - The issuer in the discovery document must exactly match the configured `issuer`.
 - `clientSecret` is required (confidential clients only).
-- The client authenticates with **`client_secret_basic`** (HTTP Basic) by default. Set
-  `'tokenEndpointAuthMethod' => 'client_secret_post'` to keep sending the secret in the request body.
+- The client authenticates with `client_secret_post` as before; `'tokenEndpointAuthMethod' => 'client_secret_basic'`
+  switches to HTTP Basic.
 
 ## Token validation
 
 - Only the algorithms in `id_token_signing_alg_values_supported` (or `idTokenSigningAlgValues`, default `RS256`)
   are accepted; `none` is always rejected. HMAC algorithms are verified with the client secret only, never with
-  the public keys. A `signer` collaborator must match the token `alg`.
+  the public keys.
+- The `signer` collaborator was removed. To pin one algorithm, use `'idTokenSigningAlgValues' => ['RS256']`.
 - ID tokens must contain `iat` and `exp`; `nbf` is checked when present.
 - An ID token returned by the `refresh_token` grant is now validated too.
-- Logout tokens: the `events` claim is now validated correctly (it never matched before), `iat` and `jti`
-  are required and the key is selected by `kid`.
+- Logout tokens: `iat`, `exp` and `jti` are required, a `typ` header must be `logout+jwt` when present and the
+  key is selected by `kid`. The `events` claim is checked by content: a JSON object per the specification, or a
+  JSON-encoded string of it (as sent by id.vut.cz).
 - Validation options (`nbfToleranceSeconds`, `maxAge`, `requireAuthTime`, `acrValues`) are no longer sent
   to the token endpoint.
 
@@ -54,6 +56,7 @@ $token = $provider->getAccessToken('authorization_code', ['code' => $code]);
 
 - `revokeAccessToken(string $token, ?string $tokenTypeHint = null)`; the revocation request uses the
   configured client authentication method.
+- `resource` (RFC 8707) accepts a single URI string.
 - `getLogoutUrl()` returns `string`, keeps the port of the end session endpoint and accepts
   `id_token_hint`, `state`, `ui_locales` and `logout_hint`.
 - `getLogoutToken()` returns `Lcobucci\JWT\Token\Plain`.

@@ -29,15 +29,37 @@ class LogoutTest extends ProviderTestCase
 		self::assertSame('session-1', $token->claims()->get('sid'));
 	}
 
-	public function testLogoutTokenWithoutExpirationMustBeRecent(): void
+	/**
+	 * id.vut.cz sends `events` as a JSON-encoded string: ->withClaim('events', json_encode([EVENT => []]))
+	 */
+	public function testIdVutEventsClaimAsJsonString(): void
 	{
 		$provider = $this->createProvider();
 
-		$provider->getLogoutToken(TokenFactory::logoutToken(['exp' => null, 'iat' => TokenFactory::NOW - 60]));
+		$token = $provider->getLogoutToken(TokenFactory::logoutToken([
+			'events' => (string)json_encode(['http://schemas.openid.net/event/backchannel-logout' => []]),
+		]));
+
+		self::assertSame('session-1', $token->claims()->get('sid'));
+	}
+
+	public function testLogoutTokenWithMediaTypeTypHeader(): void
+	{
+		$provider = $this->createProvider();
+
+		$token = $provider->getLogoutToken(TokenFactory::logoutToken([], ['typ' => 'application/logout+jwt']));
+
+		self::assertSame('session-1', $token->claims()->get('sid'));
+	}
+
+	public function testLogoutTokenWithWrongTypHeader(): void
+	{
+		$provider = $this->createProvider();
 
 		$this->expectException(InvalidTokenException::class);
-		$this->expectExceptionMessage('too old');
-		$provider->getLogoutToken(TokenFactory::logoutToken(['exp' => null, 'iat' => TokenFactory::NOW - 300]));
+		$this->expectExceptionMessage('typ');
+
+		$provider->getLogoutToken(TokenFactory::logoutToken([], ['typ' => 'JWT']));
 	}
 
 	/**
@@ -49,9 +71,12 @@ class LogoutTest extends ProviderTestCase
 			'nonce present' => [['nonce' => 'n'], 'nonce'],
 			'missing jti' => [['jti' => null], 'jti'],
 			'missing iat' => [['iat' => null], 'Issued At'],
+			'missing exp' => [['exp' => null], 'Expiration'],
 			'missing sub and sid' => [['sub' => null, 'sid' => null], 'sub'],
 			'missing events' => [['events' => null], 'events'],
 			'wrong event' => [['events' => ['http://schemas.openid.net/event/other' => new \stdClass()]], 'events'],
+			'wrong event as JSON string' => [['events' => '{"http://schemas.openid.net/event/other":{}}'], 'events'],
+			'events not JSON' => [['events' => 'backchannel-logout'], 'events'],
 			'wrong issuer' => [['iss' => 'https://attacker.example'], 'iss'],
 			'wrong audience' => [['aud' => 'other-client'], 'aud'],
 			'expired' => [['iat' => TokenFactory::NOW - 7200, 'exp' => TokenFactory::NOW - 3600], 'expired'],

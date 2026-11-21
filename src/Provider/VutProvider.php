@@ -6,6 +6,8 @@ namespace Vut2\Component\OpenIDConnectClient\Provider;
 use GuzzleHttp\ClientInterface as GuzzleClientInterface;
 use GuzzleHttp\Exception\BadResponseException;
 use League\OAuth2\Client\Grant\AbstractGrant;
+use League\OAuth2\Client\OptionProvider\HttpBasicAuthOptionProvider;
+use League\OAuth2\Client\OptionProvider\PostAuthOptionProvider;
 use League\OAuth2\Client\Provider\Exception\IdentityProviderException;
 use League\OAuth2\Client\Provider\GenericProvider;
 use League\OAuth2\Client\Token\AccessToken as LeagueAccessToken;
@@ -16,15 +18,12 @@ use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Vut2\Component\OpenIDConnectClient\Exception\InvalidConfigurationException;
 use Vut2\Component\OpenIDConnectClient\Flow\AccessToken;
-use Vut2\Component\OpenIDConnectClient\OptionProvider\ClientSecretBasicOptionProvider;
-use Vut2\Component\OpenIDConnectClient\OptionProvider\ClientSecretPostOptionProvider;
-use Vut2\Component\OpenIDConnectClient\Tool\QueryString;
 
 /**
  * OAuth 2.1 client for id.vut.cz (confidential clients only).
  *
  * - PKCE with S256 is always used.
- * - The client authenticates with `client_secret_basic` (default) or `client_secret_post`.
+ * - The client authenticates with `client_secret_post` (default) or `client_secret_basic`.
  * - Any PSR-18 HTTP client can be used instead of Guzzle.
  */
 class VutProvider extends GenericProvider
@@ -58,7 +57,7 @@ class VutProvider extends GenericProvider
 	 * Options (in addition to league/oauth2-client GenericProvider options):
 	 *  - clientId, clientSecret, redirectUri (required)
 	 *  - baseUrl: base used for default endpoint URLs (default https://id.vut.cz/auth)
-	 *  - tokenEndpointAuthMethod: client_secret_basic (default) | client_secret_post
+	 *  - tokenEndpointAuthMethod: client_secret_post (default) | client_secret_basic
 	 *  - urlEndSession, urlRevokeToken
 	 *
 	 * Collaborators: httpClient (Guzzle or any PSR-18 client), requestFactory, grantFactory, optionProvider.
@@ -96,7 +95,7 @@ class VutProvider extends GenericProvider
 		}
 		$options['pkceMethod'] = self::PKCE_METHOD_S256;
 
-		$authMethod = $options['tokenEndpointAuthMethod'] ?? self::AUTH_METHOD_CLIENT_SECRET_BASIC;
+		$authMethod = $options['tokenEndpointAuthMethod'] ?? self::AUTH_METHOD_CLIENT_SECRET_POST;
 		if (!in_array($authMethod, [self::AUTH_METHOD_CLIENT_SECRET_BASIC, self::AUTH_METHOD_CLIENT_SECRET_POST], true)) {
 			throw new InvalidConfigurationException(sprintf(
 				'Unsupported tokenEndpointAuthMethod "%s", use "%s" or "%s".',
@@ -108,25 +107,14 @@ class VutProvider extends GenericProvider
 		$options['tokenEndpointAuthMethod'] = $authMethod;
 
 		if (empty($collaborators['optionProvider'])) {
-			$collaborators['optionProvider'] = $authMethod === self::AUTH_METHOD_CLIENT_SECRET_POST
-				? new ClientSecretPostOptionProvider()
-				: new ClientSecretBasicOptionProvider();
+			$collaborators['optionProvider'] = $authMethod === self::AUTH_METHOD_CLIENT_SECRET_BASIC
+				? new HttpBasicAuthOptionProvider()
+				: new PostAuthOptionProvider();
 		}
 
 		$collaborators = $this->initPsrHttpClient($collaborators);
 
 		parent::__construct($options, $collaborators);
-	}
-
-	/**
-	 * Use a PSR-18 HTTP client (e.g. Symfony's Psr18Client) for all requests.
-	 * Pass null to switch back to the Guzzle client.
-	 */
-	public function setPsrHttpClient(?PsrClientInterface $client): self
-	{
-		$this->psrHttpClient = $client;
-
-		return $this;
 	}
 
 	public function getPsrHttpClient(): ?PsrClientInterface
@@ -136,7 +124,7 @@ class VutProvider extends GenericProvider
 
 	public function getTokenEndpointAuthMethod(): string
 	{
-		return $this->tokenEndpointAuthMethod ?? self::AUTH_METHOD_CLIENT_SECRET_BASIC;
+		return $this->tokenEndpointAuthMethod ?? self::AUTH_METHOD_CLIENT_SECRET_POST;
 	}
 
 	/**
@@ -162,11 +150,7 @@ class VutProvider extends GenericProvider
 	public function getAccessToken($grant, array $options = [])
 	{
 		$grant = $this->verifyGrant($grant);
-
-		// league/oauth2-client < 2.8 does not join a scope list; it must be one space-delimited parameter
-		if (isset($options['scope']) && is_array($options['scope'])) {
-			$options['scope'] = implode($this->getScopeSeparator(), $options['scope']);
-		}
+		$this->assertSingleResource($options);
 
 		$isAuthorizationCode = $this->isAuthorizationCodeGrant($grant);
 		if ($isAuthorizationCode && empty($this->pkceCode)) {
@@ -280,19 +264,21 @@ class VutProvider extends GenericProvider
 			}
 		}
 
-		return $parts[0] . '?' . QueryString::build($query);
+		return $parts[0] . '?' . $this->buildQueryString($query);
 	}
 
 	/**
 	 * Returns authorization parameters based on provided options.
 	 *
-	 * Additional options: prompt, max_age, acr_values (string or list), resource (string or list, RFC 8707).
+	 * Additional options: prompt, max_age, acr_values (string or list), resource (one URI, RFC 8707).
 	 *
 	 * @param array<string, mixed> $options
 	 * @return array<string, mixed> Authorization parameters
 	 */
 	protected function getAuthorizationParameters(array $options): array
 	{
+		$this->assertSingleResource($options);
+
 		if (empty($options['prompt']) && $this->prompt) {
 			$options['prompt'] = $this->prompt;
 		}
@@ -317,14 +303,6 @@ class VutProvider extends GenericProvider
 		unset($options['approval_prompt']);
 
 		return $options;
-	}
-
-	/**
-	 * @param array<string, mixed> $params
-	 */
-	protected function getAuthorizationQuery(array $params): string
-	{
-		return QueryString::build($params);
 	}
 
 	protected function getScopeSeparator(): string
@@ -355,6 +333,18 @@ class VutProvider extends GenericProvider
 	protected function isAuthorizationCodeGrant(AbstractGrant $grant): bool
 	{
 		return (string)$grant === 'authorization_code';
+	}
+
+	/**
+	 * Only one RFC 8707 resource indicator per request is supported (also the limit of e.g. Entra ID).
+	 *
+	 * @param array<string, mixed> $options
+	 */
+	private function assertSingleResource(array $options): void
+	{
+		if (isset($options['resource']) && !is_string($options['resource'])) {
+			throw new \InvalidArgumentException('Option "resource" must be a single absolute URI string.');
+		}
 	}
 
 	/**
