@@ -36,7 +36,8 @@
     "league/oauth2-client": "^2.7",
     "phpseclib/phpseclib": "^3.0.58 || ^4.0.3",
     "psr/cache": "^1.0 || ^2.0 || ^3.0",
-    "psr/http-client": "^1.0"
+    "psr/http-client": "^1.0",
+    "psr/log": "^1.1 || ^2.0 || ^3.0"
   },
   "conflict": {
     "paragonie/random_compat": "<2.0"

@@ -25,6 +25,7 @@ use League\OAuth2\Client\Token\AccessToken as LeagueAccessToken;
 use League\OAuth2\Client\Token\AccessTokenInterface;
 use League\OAuth2\Client\Tool\RequestFactory;
 use Psr\Cache\CacheItemPoolInterface;
+use Psr\Log\LoggerInterface;
 use Vut2\Component\OpenIDConnectClient\Constraint\AcrIn;
 use Vut2\Component\OpenIDConnectClient\Constraint\AuthTimeValid;
 use Vut2\Component\OpenIDConnectClient\Constraint\DoesNotHaveClaim;
@@ -75,6 +76,7 @@ class VutOpenIDConnectProvider extends VutProvider
 	protected $publicKey;
 	protected string $idTokenIssuer;
 	protected ?CacheItemPoolInterface $cache = null;
+	protected ?LoggerInterface $logger = null;
 
 	protected ?string $nonce = null;
 
@@ -104,6 +106,7 @@ class VutOpenIDConnectProvider extends VutProvider
 	 *  - signer: lcobucci/jwt signer that must match the token `alg`
 	 *  - cache: PSR-6 cache for discovery and JWKS (1 hour)
 	 *  - clock: lcobucci/clock or PSR-20 clock (useful for tests)
+	 *  - logger: PSR-3 logger, e.g. for JWKS keys that cannot be used
 	 *
 	 * @param array<string, mixed> $options
 	 * @param array<string, mixed> $collaborators
@@ -123,6 +126,13 @@ class VutOpenIDConnectProvider extends VutProvider
 				throw new \InvalidArgumentException(sprintf('Cache must be instance of %s', CacheItemPoolInterface::class));
 			}
 			$this->cache = $collaborators['cache'];
+		}
+
+		if (isset($collaborators['logger'])) {
+			if (!$collaborators['logger'] instanceof LoggerInterface) {
+				throw new \InvalidArgumentException(sprintf('Logger must be instance of %s', LoggerInterface::class));
+			}
+			$this->logger = $collaborators['logger'];
 		}
 
 		if (isset($collaborators['clock'])) {
@@ -747,7 +757,7 @@ class VutOpenIDConnectProvider extends VutProvider
 			return true;
 		});
 
-		$keys = $jwks === [] ? [] : (new JWKConverter())->multipleToPEM($jwks);
+		$keys = $jwks === [] ? [] : (new JWKConverter($this->logger))->multipleToPEM($jwks);
 		if ($keys === []) {
 			throw new InvalidConfigurationException("No valid signing keys found in discovery at $discoveryUri");
 		}

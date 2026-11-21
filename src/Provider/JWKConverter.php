@@ -4,14 +4,23 @@ declare(strict_types=1);
 namespace Vut2\Component\OpenIDConnectClient\Provider;
 
 use InvalidArgumentException;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 use Vut2\Component\OpenIDConnectClient\Crypto\Phpseclib;
 
 class JWKConverter
 {
+	private LoggerInterface $logger;
+
+	public function __construct(?LoggerInterface $logger = null)
+	{
+		$this->logger = $logger ?? new NullLogger();
+	}
+
 	/**
 	 * Converts multiple JSON Web Keys (JWKs) to PEM format.
 	 *
-	 * Keys that cannot be converted are skipped with an E_USER_WARNING.
+	 * Keys that cannot be converted are skipped and logged.
 	 *
 	 * @param array<mixed> $jwkSet The array of JWKs to convert.
 	 *
@@ -31,7 +40,7 @@ class JWKConverter
 			try {
 				$pem = $this->toPEM($jwk);
 			} catch (InvalidArgumentException $e) {
-				trigger_error($e->getMessage(), E_USER_WARNING);
+				$this->logger->warning('Skipped JWK: ' . $e->getMessage(), ['kid' => $jwk['kid'] ?? null]);
 				continue;
 			}
 
